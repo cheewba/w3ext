@@ -8,7 +8,8 @@ from eth_account import Account as Web3Account
 from .utils import construct_async_sign_and_send_raw_middleware
 from .chain import Token
 if TYPE_CHECKING:
-    from .chain import Chain, CurrencyAmount
+    from .chain import Chain
+    from .token import CurrencyAmount
 
 __all__ = ["Account", ]
 
