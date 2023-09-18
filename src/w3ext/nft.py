@@ -2,16 +2,16 @@
 import asyncio
 from typing import Optional, Any, TYPE_CHECKING
 
-from web3.contract.async_contract import AsyncContract
 from web3.types import TxParams
 
 from .utils import to_checksum_address
 if TYPE_CHECKING:
     from .account import Account
+    from .contract import Contract
 
 
 class Nft721Collection:
-    def __init__(self, contract: AsyncContract, name: str) -> None:
+    def __init__(self, contract: Contract, name: str) -> None:
         self.contract = contract
         self.name = name
 
@@ -48,6 +48,6 @@ class Nft721:
         return self._owner
 
     async def transfer(self, account: "Account", to: str, *, tx: Optional[TxParams] = None) -> None:
-        return await self.currency.functions \
+        return await self.collection.functions \
             .safeTransferFrom(account.address, to_checksum_address(to), self.id) \
             .transact(account, tx)
