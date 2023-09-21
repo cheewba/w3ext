@@ -39,8 +39,7 @@ class Account:
 
     @_onchain_required
     async def get_balance(self, token: 'Token' = None) -> 'CurrencyAmount':
-        fn = token.get_balance if isinstance(token, Token) else self._chain.get_balance
-        return await fn(self.address)
+        return await self._chain.get_balance(self.address, token)
 
     @contextmanager
     def onchain(self, chain: "Chain") -> Self:

@@ -107,7 +107,10 @@ class Chain:
             setattr(self, cache_as, collection)
         return collection
 
-    async def get_balance(self, address: Address) -> 'CurrencyAmount':
+    async def get_balance(self, address: Address, token: Optional[Token] = None) -> 'CurrencyAmount':
+        if token is not None:
+            return await token.get_balance(address)
+
         amount = await self.__web3.eth.get_balance(address)
         return CurrencyAmount(self.currency, amount)
 
