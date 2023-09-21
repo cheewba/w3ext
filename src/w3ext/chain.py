@@ -1,7 +1,7 @@
 # pylint: disable=no-name-in-module
 import asyncio
 import os
-from typing import Optional, Any, Union
+from typing import Optional, Any, Union, TYPE_CHECKING
 
 from eth_typing import Address
 from web3 import AsyncWeb3, AsyncHTTPProvider
@@ -12,6 +12,8 @@ from .contract import Contract
 from .token import Currency, Token, CurrencyAmount
 from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
+if TYPE_CHECKING:
+    from .account import Account
 
 ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
@@ -107,7 +109,13 @@ class Chain:
             setattr(self, cache_as, collection)
         return collection
 
-    async def get_balance(self, address: Address, token: Optional[Token] = None) -> 'CurrencyAmount':
+    async def get_balance(
+        self,
+        address: Union[Address, "Account"],
+        token: Optional[Token] = None
+    ) -> 'CurrencyAmount':
+        if isinstance(address, Account):
+            address = address.address
         if token is not None:
             return await token.get_balance(address)
 
