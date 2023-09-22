@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 
 class Nft721Collection:
-    def __init__(self, contract: Contract, name: str) -> None:
+    def __init__(self, contract: "Contract", name: str) -> None:
         self.contract = contract
         self.name = name
 
