@@ -42,6 +42,25 @@ class Chain:
 
         self.scan = scan
 
+    @classmethod
+    async def connect(
+        cls: "Chain",
+        rpc: str, *,
+        currency: Optional[Union[str, 'Currency']] = 'ETH',
+        chain_id: Optional[int] = None,
+        scan: Optional[str] = None
+    ) -> "Chain":
+        """ Convenient way to initialize and validate a Chain instance. """
+        w3 = AsyncWeb3(AsyncHTTPProvider(rpc))
+
+        w3_chain_id = await w3.eth.chain_id
+        if chain_id != None:
+            assert chain_id == w3_chain_id, \
+                f"Rpc chain ID doesn't match: {w3_chain_id} <> {chain_id}"
+        chain_id = chain_id or w3_chain_id
+
+        return cls(w3, currency, chain_id, scan)
+
     @property
     def currency(self):
         return self._currency
@@ -71,13 +90,6 @@ class Chain:
 
     async def _load_abi(self, name) -> Any:
         return await load_abi(os.path.join(ABI_PATH, name))
-
-    async def init(self):
-        chain_id = await self.__web3.eth.chain_id
-        if self._chain_id != None:
-            assert self._chain_id == chain_id, \
-                f"Rpc chain ID doesn't match: {chain_id} <> {self.chain_id}"
-        self._chain_id = chain_id
 
     async def load_token(
         self,
