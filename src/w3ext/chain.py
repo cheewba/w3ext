@@ -59,7 +59,7 @@ class Chain:
                 f"Rpc chain ID doesn't match: {w3_chain_id} <> {chain_id}"
         chain_id = chain_id or w3_chain_id
 
-        return cls(w3, currency, chain_id, scan)
+        return cls(w3, currency=currency, chain_id=chain_id, scan=scan)
 
     @property
     def currency(self):
