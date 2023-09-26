@@ -21,3 +21,6 @@ dynamic = ["version"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "w3ext.__version__"}
