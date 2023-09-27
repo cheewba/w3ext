@@ -1,7 +1,7 @@
 # pylint: disable=no-name-in-module
 import asyncio
 import os
-from typing import Optional, Any, Union, TYPE_CHECKING
+from typing import Optional, Any, Union
 
 from eth_typing import Address
 from web3 import AsyncWeb3, AsyncHTTPProvider
@@ -12,8 +12,7 @@ from .contract import Contract
 from .token import Currency, Token, CurrencyAmount
 from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
-if TYPE_CHECKING:
-    from .account import Account
+from .account import Account
 
 ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
@@ -143,5 +142,7 @@ class Chain:
         return '/'.join([self.scan if not self.scan.endswith('/') else self.scan[:-1], 'tx', tx_hash.hex()])
 
     def __getattr__(self, name) -> Any:
-        # let use token as a contract with predefined ABI and web3 instance
+        if name == self.currency.name:
+            return self.currency
+        # by default, let use token as a contract with predefined ABI and web3 instance
         return getattr(self.__web3, name)
