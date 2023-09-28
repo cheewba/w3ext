@@ -20,7 +20,12 @@ class Currency:
         self.symbol = symbol or name
         self.decimals = decimals
 
+    def to_amount(self, amount: Number) -> 'CurrencyAmount':
+        """ Build `CurrencyAmount` instance using amount as is. """
+        return CurrencyAmount(self, amount)
+
     def parse_amount(self, amount: Number) -> 'CurrencyAmount':
+        """ Convert human-readable amount to the `CurrencyAmount`. """
         return CurrencyAmount(self, amount * 10 ** self.decimals)
     __call__ = parse_amount
 
@@ -35,7 +40,16 @@ class Token(Currency):
         super().__init__(name, symbol, decimals)
         self.contract = contract
 
+    @property
+    def address(self):
+        return self.contract.address
+
+    def to_amount(self, amount: Number) -> 'TokenAmount':
+        """ Build `TokenAmount` instance using amount as is. """
+        return TokenAmount(self, amount)
+
     def parse_amount(self, amount: Number) -> 'TokenAmount':
+        """ Convert human-readable amount to the `TokenAmount` instance. """
         return TokenAmount(self, amount * 10 ** self.decimals)
     __call__ = parse_amount
 
