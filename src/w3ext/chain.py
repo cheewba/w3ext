@@ -138,7 +138,7 @@ class Chain:
         amount = await self.__web3.eth.get_balance(address)
         return CurrencyAmount(self.currency, amount)
 
-    async def get_nonce(self, address: Address) -> int
+    async def get_nonce(self, address: Address) -> int:
         return await self.eth.get_transaction_count(  # type: ignore
             cast(ChecksumAddress, address)
         )
