@@ -1,6 +1,6 @@
 # pylint: disable=no-name-in-module
 from contextlib import contextmanager
-from typing import TypeVar, Any, TYPE_CHECKING, ContextManager
+from typing import TypeVar, Any, TYPE_CHECKING, Union, List, Iterator, Optional
 
 from eth_account.signers.local import LocalAccount
 from eth_account import Account as Web3Account
@@ -18,7 +18,7 @@ Self = TypeVar("Self")
 
 class Account:
     """ Wrapper around Web3 Account, not bound to any ``Chain`` instance. """
-    _acc: LocalAccount = None
+    _acc: LocalAccount
 
     @classmethod
     def from_key(cls, key: str) -> 'Account':
@@ -31,7 +31,7 @@ class Account:
         return ChainAccount(self, chain)
 
     @contextmanager
-    def onchain(self, *chains: "Chain") -> ContextManager[Union["ChainAccount"|List["ChainAccount"]]]:
+    def onchain(self, *chains: "Chain") -> Iterator[Union["ChainAccount", List["ChainAccount"]]]:
         """ Context manager to add account to chains
 
             In the current context, all provided chains will know how to
@@ -73,9 +73,11 @@ class ChainAccount:
     def chain(self) -> "Chain":
         return self._chain
 
-    async def get_balance(self, token: 'Token' = None) -> 'CurrencyAmount':
-        fn = token.get_balance if isinstance(token, Token) else self._chain.get_balance
-        return await fn(self.address)
+    async def get_balance(self, token: Optional['Token'] = None) -> 'CurrencyAmount':
+        return await (
+            token.get_balance(self.address) if isinstance(token, Token)
+            else self._chain.get_balance(self.address)
+        )
 
     def __getattr__(self, name) -> Any:
         return getattr(self._account, name)

@@ -1,12 +1,12 @@
 # pylint: disable=no-name-in-module
 import asyncio
 import os
-from typing import Optional, Any, Union, TYPE_CHECKING, cast
+from typing import Optional, Any, Union, TYPE_CHECKING, cast, Type
 
-from eth_typing import AnyAddress as Address, ChecksumAddress
+from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
 from web3.middleware.geth_poa import async_geth_poa_middleware
-from web3.types import HexBytes
+from web3.types import HexBytes, TxParams
 
 from .contract import Contract
 from .token import Currency, Token, CurrencyAmount
@@ -14,6 +14,8 @@ from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
 if TYPE_CHECKING:
     from .account import Account
+
+__all__ = ["Chain"]
 
 ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
@@ -27,7 +29,7 @@ class Chain:
     scan: Optional[str]
 
     def __init__(self, rpc: Union[str, AsyncWeb3], *,
-                 currency: Optional[Union[str, 'Currency']] = 'ETH',
+                 currency: Union[str, 'Currency'] = 'ETH',
                  chain_id: Optional[int] = None,
                  scan: Optional[str] = None,
                  name: Optional[str] = None) -> None:
@@ -46,9 +48,9 @@ class Chain:
 
     @classmethod
     async def connect(
-        cls: "Chain",
+        cls: Type["Chain"],
         rpc: str, *,
-        currency: Optional[Union[str, 'Currency']] = 'ETH',
+        currency: Union[str, 'Currency'] = 'ETH',
         chain_id: Optional[int] = None,
         scan: Optional[str] = None,
         name: Optional[str] = None,
@@ -81,6 +83,9 @@ class Chain:
             setattr(self, key, abi)
         return abi
 
+    async def _load_abi(self, name) -> Any:
+        return await load_abi(os.path.join(ABI_PATH, name))
+
     async def erc20_abi(self):
         return await self._get_abi('erc20')
 
@@ -92,12 +97,9 @@ class Chain:
             self._is_eip1559 = await is_eip1559(self.__web3)
         return self._is_eip1559
 
-    async def _load_abi(self, name) -> Any:
-        return await load_abi(os.path.join(ABI_PATH, name))
-
     async def load_token(
         self,
-        contract: Address, *,
+        contract: HexAddress, *,
         cache_as: Optional[str] = None,
         abi: Optional[Any] = None
     ) -> Optional['Token']:
@@ -114,10 +116,10 @@ class Chain:
 
     async def load_nft721(
         self,
-        contract: Address, *,
+        contract: HexAddress, *,
         cache_as: Optional[str] = None,
         abi: Optional[Any] = None
-    ) -> Optional['Token']:
+    ) -> Optional['Nft721Collection']:
         token_contract = self.contract(contract, abi=abi or await self.erc721_abi())
         name = await token_contract.functions.name().call()
         collection = Nft721Collection(token_contract, name)
@@ -127,7 +129,7 @@ class Chain:
 
     async def get_balance(
         self,
-        address: Union[Address, "Account"],
+        address: Union[HexAddress, "Account"],
         token: Optional[Token] = None
     ) -> 'CurrencyAmount':
         if isinstance(address, Account):
@@ -135,15 +137,16 @@ class Chain:
         if token is not None:
             return await token.get_balance(address)
 
+        address = to_checksum_address(str(address))
         amount = await self.__web3.eth.get_balance(address)
         return CurrencyAmount(self.currency, amount)
 
-    async def get_nonce(self, address: Address) -> int:
+    async def get_nonce(self, address: HexAddress) -> int:
         return await self.eth.get_transaction_count(  # type: ignore
             cast(ChecksumAddress, address)
         )
 
-    def contract(self, address: Address, abi: Any) -> 'Contract':
+    def contract(self, address: HexAddress, abi: Any) -> 'Contract':
         return Contract(self.__web3.eth.contract(to_checksum_address(address), abi=abi), self)
 
     def get_tx_scan(self, tx_hash: HexBytes):

@@ -1,6 +1,6 @@
 # pylint: disable=no-name-in-module
 import asyncio
-from typing import Optional, Any, TYPE_CHECKING
+from typing import Optional, Any, TYPE_CHECKING, Self
 
 from web3.types import TxParams
 
@@ -42,12 +42,12 @@ class Nft721:
         self.id = _id
         self._owner = owner
 
-    async def get_owner(self, force: bool = False) -> str:
+    async def get_owner(self: Self, force: bool = False) -> Optional[str]:
         if force or not self._owner:
             self._owner = await self.collection.functions.ownerOf(self.id).call()
         return self._owner
 
-    async def transfer(self, account: "Account", to: str, *, tx: Optional[TxParams] = None) -> None:
+    async def transfer(self: Self, account: "Account", to: str, *, tx: Optional[TxParams] = None) -> None:
         return await self.collection.functions \
             .safeTransferFrom(account.address, to_checksum_address(to), self.id) \
             .transact(account, tx)

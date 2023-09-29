@@ -11,7 +11,7 @@ from eth_utils.toolz import curry
 from web3 import AsyncWeb3
 from web3._utils.async_transactions import fill_transaction_defaults
 from web3.middleware.signing import format_transaction, gen_normalized_accounts
-from web3.types import AsyncMiddleware, Middleware, RPCEndpoint, RPCResponse, TxParams
+from web3.types import AsyncMiddleware, RPCEndpoint, RPCResponse, TxParams, AsyncMiddlewareCoroutine
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -29,7 +29,7 @@ async def load_abi(filename: str, process: Optional[Callable] = None) -> str:
                 abi = await resp.json()
     else:
         with open(filename) as f:
-            abi: str = json.load(f)
+            abi = json.load(f)
 
     if process is not None:
         abi = process(abi)
@@ -65,7 +65,7 @@ async def fill_nonce(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> 
 
 def construct_async_sign_and_send_raw_middleware(
     private_key_or_account: Union[_PrivateKey, Collection[_PrivateKey]]
-) -> Middleware:
+) -> AsyncMiddleware:
     """Capture transactions sign and send as raw transactions
 
     Keyword arguments:
@@ -79,8 +79,9 @@ def construct_async_sign_and_send_raw_middleware(
     accounts = gen_normalized_accounts(private_key_or_account)
 
     async def sign_and_send_raw_middleware(
-        make_request: Callable[[RPCEndpoint, Any], Any], _async_w3: 'AsyncWeb3'
-    ) -> AsyncMiddleware:
+        make_request: Callable[[RPCEndpoint, Any], Any],
+        _async_w3: 'AsyncWeb3'
+    ) -> AsyncMiddlewareCoroutine:
 
         async def middleware(method: RPCEndpoint, params: Any) -> RPCResponse:
             if method != 'eth_sendTransaction':

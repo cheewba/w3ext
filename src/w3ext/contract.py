@@ -68,7 +68,7 @@ class ContractFunctions:
         self.__contract = contract
         self._chain = chain
 
-    def __getattr__(self, function_name: str) -> "AsyncContractFunction":
+    def __getattr__(self, function_name: str) -> "ContractFunction":
         return ContractFunction(getattr(self.__contract.functions, function_name), self._chain)
 
 
