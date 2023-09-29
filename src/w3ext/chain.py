@@ -7,7 +7,7 @@ from typing import Optional, Any, Union, TYPE_CHECKING, cast, Type
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
 from web3.middleware.geth_poa import async_geth_poa_middleware
-from web3.types import HexBytes, TxParams, HexStr
+from web3.types import HexBytes, TxParams, HexStr, TxReceipt
 
 from .contract import Contract
 from .token import Currency, Token, CurrencyAmount
@@ -160,6 +160,9 @@ class Chain:
 
     async def send_raw_transaction(self, data: Union[HexStr, bytes]) -> HexBytes:
         return await self.__web3.eth.send_raw_transaction(data)
+
+    async def wait_for_transaction_receipt(self, tx_hash: HexBytes, timeout: float = 180) -> TxReceipt:
+        return await self.__web3.eth.wait_for_transaction_receipt(tx_hash, timeout)
 
     def contract(self, address: HexAddress, abi: Any) -> 'Contract':
         return Contract(self.__web3.eth.contract(to_checksum_address(address), abi=abi), self)
