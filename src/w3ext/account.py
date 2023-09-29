@@ -4,6 +4,7 @@ from typing import TypeVar, Any, TYPE_CHECKING, Union, List, Iterator, Optional
 
 from eth_account.signers.local import LocalAccount
 from eth_account import Account as Web3Account
+from eth_typing import ChecksumAddress
 
 from .utils import construct_async_sign_and_send_raw_middleware
 from .chain import Token
@@ -19,6 +20,7 @@ Self = TypeVar("Self")
 class Account:
     """ Wrapper around Web3 Account, not bound to any ``Chain`` instance. """
     _acc: LocalAccount
+    address: ChecksumAddress
 
     @classmethod
     def from_key(cls, key: str) -> 'Account':

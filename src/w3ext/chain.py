@@ -1,12 +1,13 @@
 # pylint: disable=no-name-in-module
 import asyncio
 import os
+from contextlib import ExitStack
 from typing import Optional, Any, Union, TYPE_CHECKING, cast, Type
 
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
 from web3.middleware.geth_poa import async_geth_poa_middleware
-from web3.types import HexBytes, TxParams
+from web3.types import HexBytes, TxParams, HexStr
 
 from .contract import Contract
 from .token import Currency, Token, CurrencyAmount
@@ -145,6 +146,20 @@ class Chain:
         return await self.eth.get_transaction_count(  # type: ignore
             cast(ChecksumAddress, address)
         )
+
+    async def send_transaction(self, tx: TxParams, account: Optional["Account"] = None) -> HexBytes:
+        with ExitStack() as stack:
+            if account is not None:
+                stack.enter_context(account.onchain())
+                tx['from'] = account.address
+
+            return await self.__web3.eth.send_transaction(tx)
+
+        # silent mypy error "missing return statement"
+        assert False, "unreachable"
+
+    async def send_raw_transaction(self, data: Union[HexStr, bytes]) -> HexBytes:
+        return await self.__web3.eth.send_raw_transaction(data)
 
     def contract(self, address: HexAddress, abi: Any) -> 'Contract':
         return Contract(self.__web3.eth.contract(to_checksum_address(address), abi=abi), self)
