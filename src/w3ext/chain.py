@@ -1,9 +1,9 @@
 # pylint: disable=no-name-in-module
 import asyncio
 import os
-from typing import Optional, Any, Union
+from typing import Optional, Any, Union, TYPE_CHECKING, cast
 
-from eth_typing import Address
+from eth_typing import AnyAddress as Address, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
 from web3.middleware.geth_poa import async_geth_poa_middleware
 from web3.types import HexBytes
@@ -12,6 +12,8 @@ from .contract import Contract
 from .token import Currency, Token, CurrencyAmount
 from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
+if TYPE_CHECKING:
+    from .account import Account
 
 ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
@@ -27,7 +29,8 @@ class Chain:
     def __init__(self, rpc: Union[str, AsyncWeb3], *,
                  currency: Optional[Union[str, 'Currency']] = 'ETH',
                  chain_id: Optional[int] = None,
-                 scan: Optional[str] = None) -> None:
+                 scan: Optional[str] = None,
+                 name: Optional[str] = None) -> None:
         self.__web3 = (rpc if isinstance(rpc, AsyncWeb3) else
                        AsyncWeb3(AsyncHTTPProvider(rpc)))
         self.__web3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
@@ -39,6 +42,28 @@ class Chain:
         self._chain_id = chain_id
 
         self.scan = scan
+        self.name = name
+
+    @classmethod
+    async def connect(
+        cls: "Chain",
+        rpc: str, *,
+        currency: Optional[Union[str, 'Currency']] = 'ETH',
+        chain_id: Optional[int] = None,
+        scan: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> "Chain":
+        """ Convenient way to initialize and validate a Chain instance. """
+        w3 = AsyncWeb3(AsyncHTTPProvider(rpc))
+
+        w3_chain_id = await w3.eth.chain_id
+        if chain_id != None:
+            assert chain_id == w3_chain_id, \
+                f"Rpc chain ID doesn't match: {w3_chain_id} <> {chain_id}"
+        chain_id = chain_id or w3_chain_id
+
+        return cls(w3, currency=currency, chain_id=chain_id,
+                   scan=scan, name=name)
 
     @property
     def currency(self):
@@ -70,13 +95,6 @@ class Chain:
     async def _load_abi(self, name) -> Any:
         return await load_abi(os.path.join(ABI_PATH, name))
 
-    async def init(self):
-        chain_id = await self.__web3.eth.chain_id
-        if self._chain_id != None:
-            assert self._chain_id == chain_id, \
-                f"Rpc chain ID doesn't match: {chain_id} <> {self.chain_id}"
-        self._chain_id = chain_id
-
     async def load_token(
         self,
         contract: Address, *,
@@ -107,9 +125,23 @@ class Chain:
             setattr(self, cache_as, collection)
         return collection
 
-    async def get_balance(self, address: Address) -> 'CurrencyAmount':
+    async def get_balance(
+        self,
+        address: Union[Address, "Account"],
+        token: Optional[Token] = None
+    ) -> 'CurrencyAmount':
+        if isinstance(address, Account):
+            address = address.address
+        if token is not None:
+            return await token.get_balance(address)
+
         amount = await self.__web3.eth.get_balance(address)
         return CurrencyAmount(self.currency, amount)
+
+    async def get_nonce(self, address: Address) -> int:
+        return await self.eth.get_transaction_count(  # type: ignore
+            cast(ChecksumAddress, address)
+        )
 
     def contract(self, address: Address, abi: Any) -> 'Contract':
         return Contract(self.__web3.eth.contract(to_checksum_address(address), abi=abi), self)
@@ -122,3 +154,6 @@ class Chain:
     def __getattr__(self, name) -> Any:
         # let use token as a contract with predefined ABI and web3 instance
         return getattr(self.__web3, name)
+
+    def __str__(self) -> str:
+        return self.name or f"Chain#{self.chain_id}"
