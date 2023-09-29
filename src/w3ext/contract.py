@@ -6,7 +6,8 @@ from web3.contract.async_contract import AsyncContract, AsyncContractFunction
 from .utils import fill_nonce, fill_gas_price
 
 if TYPE_CHECKING:
-    from .chain import Chain, Account
+    from .chain import Chain
+    from .account import Account
 
 __all__ = ["Contract"]
 
