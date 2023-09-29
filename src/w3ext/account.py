@@ -1,6 +1,6 @@
 # pylint: disable=no-name-in-module
 from contextlib import contextmanager
-from typing import TypeVar, Any, TYPE_CHECKING
+from typing import TypeVar, Any, TYPE_CHECKING, ContextManager
 
 from eth_account.signers.local import LocalAccount
 from eth_account import Account as Web3Account
@@ -27,10 +27,17 @@ class Account:
         return instance
 
     def use_chain(self, chain: "Chain") -> "ChainAccount":
+        """ Return account bound to the provided chain instance. """
         return ChainAccount(self, chain)
 
     @contextmanager
-    def onchain(self, *chains: "Chain") -> Self:
+    def onchain(self, *chains: "Chain") -> ContextManager[Union["ChainAccount"|List["ChainAccount"]]]:
+        """ Context manager to add account to chains
+
+            In the current context, all provided chains will know how to
+            sign transactions sent from that account's address, without
+            explicit access to that account.
+        """
         chains_processed = []
         try:
             for chain in chains:
