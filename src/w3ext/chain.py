@@ -10,6 +10,7 @@ from web3.middleware.geth_poa import async_geth_poa_middleware
 from web3.types import HexBytes, TxParams, HexStr, TxReceipt
 
 from .contract import Contract
+from .exceptions import ChainException
 from .token import Currency, Token, CurrencyAmount
 from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
@@ -22,27 +23,26 @@ ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
 
 class Chain:
-    __web3: AsyncWeb3
     _currency: 'Currency'
-    _chain_id: Optional[int]
+    _chain_id: str
+
+    __web3: Optional[AsyncWeb3] = None
     _is_eip1559: Optional[bool] = None
 
     scan: Optional[str]
 
-    def __init__(self, rpc: Union[str, AsyncWeb3], *,
-                 currency: Union[str, 'Currency'] = 'ETH',
-                 chain_id: Optional[int] = None,
-                 scan: Optional[str] = None,
-                 name: Optional[str] = None) -> None:
-        self.__web3 = (rpc if isinstance(rpc, AsyncWeb3) else
-                       AsyncWeb3(AsyncHTTPProvider(rpc)))
-        self.__web3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
-
+    def __init__(
+        self,
+        chain_id: Union[str, int],
+        currency: Union[str, 'Currency'] = 'ETH',
+        scan: Optional[str] = None,
+        name: Optional[str] = None
+    ) -> None:
         if not isinstance(currency, Currency):
             currency = Currency(currency, currency)
         self._currency = currency
         setattr(self, currency.symbol, currency)
-        self._chain_id = chain_id
+        self._chain_id = str(chain_id)
 
         self.scan = scan
         self.name = name
@@ -50,23 +50,40 @@ class Chain:
     @classmethod
     async def connect(
         cls: Type["Chain"],
-        rpc: str, *,
+        rpc: str,
+        chain_id: Union[str, int],
+        *,
         currency: Union[str, 'Currency'] = 'ETH',
-        chain_id: Optional[int] = None,
         scan: Optional[str] = None,
         name: Optional[str] = None,
     ) -> "Chain":
-        """ Convenient way to initialize and validate a Chain instance. """
-        w3 = AsyncWeb3(AsyncHTTPProvider(rpc))
+        """ Convenient way to initialize Chain instance and connect to RPC. """
+        instance = cls(chain_id, currency, scan, name)
+        await instance.connect_rpc(rpc)
+        return instance
 
-        w3_chain_id = await w3.eth.chain_id
-        if chain_id != None:
-            assert chain_id == w3_chain_id, \
-                f"Rpc chain ID doesn't match: {w3_chain_id} <> {chain_id}"
-        chain_id = chain_id or w3_chain_id
+    async def _verify_chain_id(self, chain_id: str):
+        w3_chain_id = str(await self._web3.eth.chain_id)
+        if self._chain_id != None:
+            raise ChainException(f"{self.name}: Unexpected chain_id received "
+                                 "({w3_chain_id} vs expected {self._chain_id})")
 
-        return cls(w3, currency=currency, chain_id=chain_id,
-                   scan=scan, name=name)
+    async def connect_rpc(self, rpc: Union[str, AsyncWeb3]) -> None:
+        if self.__web3 is not None:
+            self.__web3.middleware_onion.remove('__async_geth_poa_middleware')
+
+        self.__web3 = w3 = (rpc if isinstance(rpc, AsyncWeb3) else
+                            AsyncWeb3(AsyncHTTPProvider(rpc)))
+        w3.middleware_onion.inject(async_geth_poa_middleware,
+                                   name='__async_geth_poa_middleware', layer=0)
+        await self._verify_chain_id(self.chain_id)
+
+    @property
+    def _web3(self) -> AsyncWeb3:
+        """ AsyncWeb3 instance, for internal use only. """
+        if not self.__web3:
+            raise ChainException(f"{self.name}: RPC Connection is required")
+        return self.__web3
 
     @property
     def currency(self):
@@ -95,7 +112,7 @@ class Chain:
 
     async def is_eip1559(self) -> bool:
         if (self._is_eip1559 is None):
-            self._is_eip1559 = await is_eip1559(self.__web3)
+            self._is_eip1559 = await is_eip1559(self._web3)
         return self._is_eip1559
 
     async def load_token(
@@ -139,7 +156,7 @@ class Chain:
             return await token.get_balance(address)
 
         address = to_checksum_address(str(address))
-        amount = await self.__web3.eth.get_balance(address)
+        amount = await self._web3.eth.get_balance(address)
         return CurrencyAmount(self.currency, amount)
 
     async def get_nonce(self, address: HexAddress) -> int:
@@ -153,19 +170,19 @@ class Chain:
                 stack.enter_context(account.onchain())
                 tx['from'] = account.address
 
-            return await self.__web3.eth.send_transaction(tx)
+            return await self._web3.eth.send_transaction(tx)
 
         # silent mypy error "missing return statement"
         assert False, "unreachable"
 
     async def send_raw_transaction(self, data: Union[HexStr, bytes]) -> HexBytes:
-        return await self.__web3.eth.send_raw_transaction(data)
+        return await self._web3.eth.send_raw_transaction(data)
 
     async def wait_for_transaction_receipt(self, tx_hash: HexBytes, timeout: float = 180) -> TxReceipt:
-        return await self.__web3.eth.wait_for_transaction_receipt(tx_hash, timeout)
+        return await self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout)
 
     def contract(self, address: HexAddress, abi: Any) -> 'Contract':
-        return Contract(self.__web3.eth.contract(to_checksum_address(address), abi=abi), self)
+        return Contract(self._web3.eth.contract(to_checksum_address(address), abi=abi), self)
 
     def get_tx_scan(self, tx_hash: HexBytes):
         if not self.scan:
@@ -174,7 +191,7 @@ class Chain:
 
     def __getattr__(self, name) -> Any:
         # let use token as a contract with predefined ABI and web3 instance
-        return getattr(self.__web3, name)
+        return getattr(self._web3, name)
 
     def __str__(self) -> str:
         return self.name or f"Chain#{self.chain_id}"
