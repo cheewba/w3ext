@@ -6,6 +6,13 @@ from typing import Optional, Any, Union, TYPE_CHECKING, cast, Type
 
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
+from web3.providers import AsyncBaseProvider
+from web3.middleware import (
+    async_attrdict_middleware,
+    async_buffered_gas_estimate_middleware,
+    async_gas_price_strategy_middleware,
+    async_validation_middleware,
+)
 from web3.middleware.geth_poa import async_geth_poa_middleware
 from web3.types import HexBytes, TxParams, HexStr, TxReceipt
 
@@ -14,19 +21,21 @@ from .exceptions import ChainException
 from .token import Currency, Token, CurrencyAmount
 from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
-if TYPE_CHECKING:
-    from .account import Account
+from .account import Account
 
 __all__ = ["Chain"]
 
 ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
+async def a_dummy(value):
+    return value
+
 
 class Chain:
     _currency: 'Currency'
     _chain_id: str
+    __web3: AsyncWeb3
 
-    __web3: Optional[AsyncWeb3] = None
     _is_eip1559: Optional[bool] = None
 
     scan: Optional[str]
@@ -38,12 +47,18 @@ class Chain:
         scan: Optional[str] = None,
         name: Optional[str] = None
     ) -> None:
-        if not isinstance(currency, Currency):
-            currency = Currency(currency, currency)
-        self._currency = currency
-        setattr(self, currency.symbol, currency)
+
+        self.__web3 = w3 = AsyncWeb3(middlewares=[
+            (async_gas_price_strategy_middleware, "gas_price_strategy"),
+            (async_attrdict_middleware, "attrdict"),
+            (async_validation_middleware, "validation"),
+            (async_buffered_gas_estimate_middleware, "gas_estimate"),
+            async_geth_poa_middleware,
+        ])
+        # w3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
         self._chain_id = str(chain_id)
 
+        self.currency = currency
         self.scan = scan
         self.name = name
 
@@ -64,30 +79,28 @@ class Chain:
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
-        if self._chain_id != None:
+        if self._chain_id != w3_chain_id:
             raise ChainException(f"{self.name}: Unexpected chain_id received "
                                  "({w3_chain_id} vs expected {self._chain_id})")
 
-    async def connect_rpc(self, rpc: Union[str, AsyncWeb3]) -> None:
-        if self.__web3 is not None:
-            self.__web3.middleware_onion.remove('__async_geth_poa_middleware')
-
-        self.__web3 = w3 = (rpc if isinstance(rpc, AsyncWeb3) else
-                            AsyncWeb3(AsyncHTTPProvider(rpc)))
-        w3.middleware_onion.inject(async_geth_poa_middleware,
-                                   name='__async_geth_poa_middleware', layer=0)
+    async def connect_rpc(self, rpc: Union[str, AsyncBaseProvider]) -> None:
+        self.__web3.provider = (rpc if isinstance(rpc, AsyncBaseProvider) else
+                                AsyncHTTPProvider(rpc))
         await self._verify_chain_id(self.chain_id)
 
     @property
     def _web3(self) -> AsyncWeb3:
         """ AsyncWeb3 instance, for internal use only. """
-        if not self.__web3:
-            raise ChainException(f"{self.name}: RPC Connection is required")
         return self.__web3
 
     @property
     def currency(self):
         return self._currency
+
+    @currency.setter
+    def currency(self, currency: Union['Currency', str]):
+        self._currency = (currency if isinstance(currency, Currency)
+                          else Currency(currency, currency))
 
     @property
     def chain_id(self):
@@ -119,13 +132,15 @@ class Chain:
         self,
         contract: HexAddress, *,
         cache_as: Optional[str] = None,
-        abi: Optional[Any] = None
+        abi: Optional[Any] = None,
+        **kwargs
     ) -> Optional['Token']:
         token_contract = self.contract(contract, abi=abi or await self.erc20_abi())
+
         name, symbol, decimals = await asyncio.gather(*[
-            token_contract.functions.name().call(),
-            token_contract.functions.symbol().call(),
-            token_contract.functions.decimals().call(),
+            getattr(token_contract.functions, key)().call()
+            if (val := kwargs.get(key, None)) is None else a_dummy(val)
+            for key in ['name', 'symbol', 'decimals']
         ])
         token = Token(token_contract, name, symbol, decimals)
         if (cache_as is not None):
@@ -190,6 +205,8 @@ class Chain:
         return '/'.join([self.scan if not self.scan.endswith('/') else self.scan[:-1], 'tx', tx_hash.hex()])
 
     def __getattr__(self, name) -> Any:
+        if name == self.currency.symbol:
+            return self.currency
         # let use token as a contract with predefined ABI and web3 instance
         return getattr(self._web3, name)
 
