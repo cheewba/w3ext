@@ -34,6 +34,8 @@ class Currency:
 
     def __str__(self) -> str:
         return self.symbol or self.name
+    def __repr__(self) -> str:
+        return str(self)
 
 
 class Token(Currency):
@@ -108,22 +110,23 @@ class CurrencyAmount:
             return self.__class__(self.currency, val)
         return val
 
+    def _new_amount(self: Self, amount: Union[int, str]) -> Self:
+        return self.__class__(self.currency, amount)
+
     def __add__(self: Self, other: Self) -> Self:
-        return self.__class__(self.currency, self.amount + self._to_amount(other).amount)
+        return self._new_amount(self.amount + self._to_amount(other).amount)
     __radd__ = __add__
 
     def __sub__(self: Self, other: Self) -> Self:
-        return self.__class__(self.currency, self.amount - self._to_amount(other).amount)
+        return self._new_amount(self.amount - self._to_amount(other).amount)
     __rsub__ = __sub__
 
     def __mul__(self: Self, other: Self) -> Self:
-        return self.__class__(self.currency,
-                              int(self.amount * self._to_amount(other).amount / 10 ** other.currency.decimals))
+        return self._new_amount(int(self.amount * self._to_amount(other).amount / 10 ** other.currency.decimals))
     __rmul__ = __mul__
 
     def __div__(self: Self, other: Self) -> Self:
-        return self.__class__(self.currency,
-                              int(self.amount / self._to_amount(other).amount / 10 ** other.currency.decimals))
+        return self._new_amount(int(self.amount / self._to_amount(other).amount / 10 ** other.currency.decimals))
     __rdiv__ = __div__
 
     def __gt__(self: Self, other: Self) -> bool:
@@ -158,6 +161,9 @@ class CurrencyAmount:
 
     def __str__(self) -> str:
         return f"{self.to_fixed()} {self.currency}"
+
+    def __repr__(self) -> str:
+        return str(self)
 
     def to_fixed(self, decimals=3):
         return round(self.amount / 10 ** self.currency.decimals, decimals)
