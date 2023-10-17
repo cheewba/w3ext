@@ -1,1 +1,1 @@
-include src/abi/*.json
+include src/w3ext/abi/*.json
