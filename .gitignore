@@ -1,6 +1,7 @@
 .env
 __pycache__
 .vscode
+.mypy_cache
 build/
 dist/
 *.egg-info/
