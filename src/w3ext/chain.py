@@ -2,7 +2,7 @@
 import asyncio
 import os
 from contextlib import ExitStack
-from typing import Optional, Any, Union, TYPE_CHECKING, cast, Type
+from typing import Optional, Any, Union, cast, Type
 
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
@@ -48,7 +48,7 @@ class Chain:
         name: Optional[str] = None
     ) -> None:
 
-        self.__web3 = w3 = AsyncWeb3(middlewares=[
+        self.__web3 = AsyncWeb3(middlewares=[
             (async_gas_price_strategy_middleware, "gas_price_strategy"),
             (async_attrdict_middleware, "attrdict"),
             (async_validation_middleware, "validation"),
@@ -79,9 +79,9 @@ class Chain:
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
-        if self._chain_id != w3_chain_id:
+        if chain_id != w3_chain_id:
             raise ChainException(f"{self.name}: Unexpected chain_id received "
-                                 "({w3_chain_id} vs expected {self._chain_id})")
+                                 "({w3_chain_id} vs expected {chain_id})")
 
     async def connect_rpc(self, rpc: Union[str, AsyncBaseProvider]) -> None:
         self.__web3.provider = (rpc if isinstance(rpc, AsyncBaseProvider) else
@@ -182,8 +182,11 @@ class Chain:
     async def send_transaction(self, tx: TxParams, account: Optional["Account"] = None) -> HexBytes:
         with ExitStack() as stack:
             if account is not None:
-                stack.enter_context(account.onchain())
+                stack.enter_context(account.onchain(self))
                 tx['from'] = account.address
+                tx['chainId'] = hex(int(self.chain_id))
+                if 'to' in tx:
+                    tx['to'] = to_checksum_address(tx['to'])
 
             return await self._web3.eth.send_transaction(tx)
 
@@ -196,8 +199,11 @@ class Chain:
     async def wait_for_transaction_receipt(self, tx_hash: HexBytes, timeout: float = 180) -> TxReceipt:
         return await self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout)
 
-    def contract(self, address: HexAddress, abi: Any) -> 'Contract':
-        return Contract(self._web3.eth.contract(to_checksum_address(address), abi=abi), self)
+    def contract(self, address: HexAddress, abi: Optional[Any] = None) -> 'Contract':
+        address = to_checksum_address(address)
+        contract = (self._web3.eth.contract(address, abi=abi)
+                    if abi is not None else address)
+        return Contract(contract, self)
 
     def get_tx_scan(self, tx_hash: HexBytes):
         if not self.scan:

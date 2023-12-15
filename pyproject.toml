@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "web3==6.0.0",
+    "web3==6.11.4",
     'aiohttp~=3.8.4',
 ]
 dynamic = ["version"]

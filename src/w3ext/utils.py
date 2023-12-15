@@ -8,10 +8,14 @@ from eth_account.signers.local import LocalAccount
 from eth_keys.datatypes import PrivateKey
 from eth_typing import ChecksumAddress, HexStr
 from eth_utils.toolz import curry
+from eth_utils.crypto import keccak
 from web3 import AsyncWeb3
-from web3._utils.async_transactions import fill_transaction_defaults
 from web3.middleware.signing import format_transaction, gen_normalized_accounts
 from web3.types import AsyncMiddleware, RPCEndpoint, RPCResponse, TxParams, AsyncMiddlewareCoroutine
+try:
+    from web3._utils.async_transactions import async_fill_transaction_defaults
+except ImportError:
+    from web3._utils.async_transactions import fill_transaction_defaults as async_fill_transaction_defaults
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -43,10 +47,22 @@ async def is_eip1559(w3: 'AsyncWeb3'):
 
 
 async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
-    is_eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559')
+    _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559')
                         else is_eip1559(w3))
-    if not is_eip1559:
+    if not _eip1559 and 'gasPrice' not in transaction:
         transaction['gasPrice'] = await w3.eth.gas_price
+    return transaction
+
+
+async def fill_chain_id(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
+    if transaction.get("chainId") is None:
+        if isinstance(w3, AsyncWeb3):
+            transaction['chainId'] = hex(int(await w3.eth.chain_id))
+        elif (chain_id := getattr(w3, 'chain_id', None)) is not None:
+            transaction['chainId'] = hex(int(chain_id))
+    if ((chain_id := transaction.get('chainId')) is not None
+            and not str(chain_id).startswith('0x')):
+        transaction['chainId'] = hex(int(chain_id))
     return transaction
 
 
@@ -87,8 +103,10 @@ def construct_async_sign_and_send_raw_middleware(
             if method != 'eth_sendTransaction':
                 return await make_request(method, params)
 
-            transaction = await fill_nonce(_async_w3, params[0])
-            transaction = await fill_transaction_defaults(_async_w3, transaction)
+            transaction = params[0]
+            transaction = await fill_chain_id(_async_w3, transaction)
+            transaction = await fill_nonce(_async_w3, transaction)
+            transaction = await async_fill_transaction_defaults(_async_w3, transaction)
             transaction = await fill_gas_price(_async_w3, transaction)
             transaction = format_transaction(transaction)
 
@@ -107,3 +125,25 @@ def construct_async_sign_and_send_raw_middleware(
         return middleware
 
     return sign_and_send_raw_middleware
+
+
+def keccak256(value: Union[str, bytes]) -> str:
+    if isinstance(value, bytes):
+        hashed = keccak(value)
+    elif value.startswith('0x'):
+        hashed = keccak(hexstr=value)
+    else:
+        hashed = keccak(text=value)
+
+    hex = hashed.hex()
+    # Add the '0x' prefix if not present
+    if not hex.startswith('0x'):
+        hex = '0x' + hex
+    return hex
+
+
+class AttrDict(dict):
+    def __getattr__(self, name):
+        if name in self:
+            return self[name]
+        super().__getattribute__(name)

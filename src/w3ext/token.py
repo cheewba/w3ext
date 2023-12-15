@@ -53,8 +53,12 @@ class Token(Currency):
         self.contract = contract
 
     @property
-    def address(self):
+    def address(self) -> str:
         return self.contract.address
+
+    @property
+    def chain_id(self) -> str:
+        return self.contract.chain_id
 
     def to_amount(self, amount: int) -> 'TokenAmount':
         """ Build `TokenAmount` instance using amount as is. """
@@ -103,7 +107,7 @@ class CurrencyAmount:
         self.currency = currency
         if isinstance(amount, str):
             amount = int(amount, 16 if amount.startswith('0x') else 10)
-        self.amount = amount
+        self.amount = int(amount)
 
     def _to_amount(self: Self, val: Union[str, int, "CurrencyAmount"]) -> "CurrencyAmount":
         if not isinstance(val, CurrencyAmount):
@@ -176,3 +180,11 @@ class TokenAmount(CurrencyAmount):
         return await self.currency.functions \
             .transfer(to, self.amount) \
             .transact(account, tx)
+
+    def approve(
+        self,
+        account: "Account",
+        spender: HexAddress,
+        transaction: Optional[TxParams] = None
+    ) -> HexBytes:
+        return self.currency.approve(account, spender, self, transaction)
