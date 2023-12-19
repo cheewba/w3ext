@@ -85,7 +85,7 @@ class Account:
                 pass
 
         if is_eip712:
-            encoded = encode_structured_data(data)
+            encoded = encode_typed_data(data)
         elif (isinstance(data, bytes)):
             encoded = encode_defunct(bytes=data)
         elif data.startswith('0x'):
