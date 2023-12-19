@@ -42,6 +42,7 @@ class Account:
     @classmethod
     def from_key(cls, key: str) -> 'Account':
         instance = cls()
+        key = key if key.startswith('0x') else f"0x{key}"
         instance._acc = Web3Account.from_key(key)
         return instance
 
