@@ -71,10 +71,11 @@ class Chain:
         currency: Union[str, 'Currency'] = 'ETH',
         scan: Optional[str] = None,
         name: Optional[str] = None,
+        request_kwargs: Optional[dict] = None
     ) -> "Chain":
         """ Convenient way to initialize Chain instance and connect to RPC. """
         instance = cls(chain_id, currency, scan, name)
-        await instance.connect_rpc(rpc)
+        await instance.connect_rpc(rpc, request_kwargs)
         return instance
 
     async def _verify_chain_id(self, chain_id: str):
@@ -83,9 +84,13 @@ class Chain:
             raise ChainException(f"{self.name}: Unexpected chain_id received "
                                  "({w3_chain_id} vs expected {chain_id})")
 
-    async def connect_rpc(self, rpc: Union[str, AsyncBaseProvider]) -> None:
+    async def connect_rpc(
+        self,
+        rpc: Union[str, AsyncBaseProvider],
+        request_kwargs: Optional[dict] = None
+    ) -> None:
         self.__web3.provider = (rpc if isinstance(rpc, AsyncBaseProvider) else
-                                AsyncHTTPProvider(rpc))
+                                AsyncHTTPProvider(rpc, request_kwargs))
         await self._verify_chain_id(self.chain_id)
 
     @property

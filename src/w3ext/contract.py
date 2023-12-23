@@ -36,12 +36,13 @@ class NotBoundContractFunction:
         self.chain = chain
         self.address = contract_address
 
-    def _get_abi(self, signature: Signature):
+    def _get_abi(self, signature: FunctionSignature):
+        sig_input = signature if (no_output := isinstance(signature[0], str)) else signature[0]
+        sig_output = signature[1] if not no_output else []
         inputs = [{"name": f"arg{i}", "type": item}
-                  for i, item in enumerate(signature[0])]
+                  for i, item in enumerate(sig_input)]
 
-        output = (signature[1] if len(signature) > 1 else [])
-        output = [output] if isinstance(output, str) else output
+        output = [sig_output] if isinstance(sig_output, str) else sig_output
         outputs = [{"name": "", "type": item} for item in output]
 
         return {
@@ -53,7 +54,7 @@ class NotBoundContractFunction:
         }
 
 
-    def __getitem__(self, signature: Signature):
+    def __getitem__(self, signature: FunctionSignature):
         fn = AsyncContractFunction.factory(
             self.name, w3=self.chain, address=self.address,
             abi=self._get_abi(signature), function_identifier=self.name

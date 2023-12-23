@@ -47,10 +47,11 @@ async def is_eip1559(w3: 'AsyncWeb3'):
 
 
 async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
-    _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559')
-                        else is_eip1559(w3))
-    if not _eip1559 and 'gasPrice' not in transaction:
-        transaction['gasPrice'] = await w3.eth.gas_price
+    if 'gasPrice' not in transaction:
+        _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559')
+                            else is_eip1559(w3))
+        if not _eip1559:
+            transaction['gasPrice'] = await w3.eth.gas_price
     return transaction
 
 
