@@ -1,19 +1,20 @@
 # pylint: disable=no-name-in-module
 import asyncio
 import os
-from contextlib import ExitStack
+from contextlib import ExitStack, asynccontextmanager
 from typing import Optional, Any, Union, cast, Type
 
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3, AsyncHTTPProvider
+from web3.eth import AsyncEth
 from web3.providers import AsyncBaseProvider
 from web3.middleware import (
-    async_attrdict_middleware,
-    async_buffered_gas_estimate_middleware,
-    async_gas_price_strategy_middleware,
-    async_validation_middleware,
+    AttributeDictMiddleware,
+    BufferedGasEstimateMiddleware,
+    GasPriceStrategyMiddleware,
+    ValidationMiddleware,
+    ExtraDataToPOAMiddleware
 )
-from web3.middleware.geth_poa import async_geth_poa_middleware
 from web3.types import HexBytes, TxParams, HexStr, TxReceipt
 
 from .contract import Contract
@@ -21,6 +22,7 @@ from .exceptions import ChainException
 from .token import Currency, Token, CurrencyAmount
 from .nft import Nft721Collection
 from .utils import is_eip1559, load_abi, to_checksum_address
+from .batch import Batch, is_batch_method, to_batch_aware_method
 from .account import Account
 
 __all__ = ["Chain"]
@@ -29,6 +31,23 @@ ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
 
 async def a_dummy(value):
     return value
+
+
+class AsyncEthProxy:
+    def __init__(self, eth: AsyncEth, chain: "Chain") -> None:
+        self._eth = eth
+        self._chain = chain
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._eth, name)
+        if is_batch_method(self._eth, name):
+            return to_batch_aware_method(self._chain, value)
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if  name not in ('_eth', '_chain'):
+            setattr(self._eth, name, value)
+        super().__setattr__(name, value)
 
 
 class Chain:
@@ -48,19 +67,22 @@ class Chain:
         name: Optional[str] = None
     ) -> None:
 
-        self.__web3 = AsyncWeb3(middlewares=[
-            (async_gas_price_strategy_middleware, "gas_price_strategy"),
-            (async_attrdict_middleware, "attrdict"),
-            (async_validation_middleware, "validation"),
-            (async_buffered_gas_estimate_middleware, "gas_estimate"),
-            async_geth_poa_middleware,
+        self.__web3 = AsyncWeb3(middleware=[
+            GasPriceStrategyMiddleware,
+            AttributeDictMiddleware,
+            ValidationMiddleware,
+            BufferedGasEstimateMiddleware,
+            ExtraDataToPOAMiddleware,
         ])
-        # w3.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+        self.__web3.eth = AsyncEthProxy(self.__web3.eth, self)
         self._chain_id = str(chain_id)
 
         self.currency = currency
         self.scan = scan
         self.name = name
+
+        self._batcher = None
+        self._batcher_requests = None
 
     @classmethod
     async def connect(
@@ -77,6 +99,22 @@ class Chain:
         instance = cls(chain_id, currency, scan, name)
         await instance.connect_rpc(rpc, request_kwargs)
         return instance
+
+    @property
+    def _is_batching(self):
+        return self._batcher is not None
+
+    @asynccontextmanager
+    async def use_batch(self, max_size: int = None, max_wait: float = None):
+        try:
+            async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
+                self._batcher = batcher
+                yield batcher
+        finally:
+            self._batcher = None
+
+    async def _add_to_batch_request_info(self, request_info):
+        return await self._batcher._add_request_info(request_info)
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
@@ -213,7 +251,10 @@ class Chain:
     def get_tx_scan(self, tx_hash: HexBytes):
         if not self.scan:
             return tx_hash
-        return '/'.join([self.scan if not self.scan.endswith('/') else self.scan[:-1], 'tx', tx_hash.hex()])
+        hash = tx_hash.hex()
+        if not hash.startswith('0x'):
+            hash = f"0x{hash}"
+        return '/'.join([self.scan if not self.scan.endswith('/') else self.scan[:-1], 'tx', hash])
 
     def __getattr__(self, name) -> Any:
         if name == self.currency.symbol:

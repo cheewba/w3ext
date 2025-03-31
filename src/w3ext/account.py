@@ -39,6 +39,9 @@ class Account:
     _acc: LocalAccount
     address: ChecksumAddress
 
+    def __init__(self) -> None:
+        self._acc = Web3Account()
+
     @classmethod
     def from_key(cls, key: str) -> 'Account':
         instance = cls()

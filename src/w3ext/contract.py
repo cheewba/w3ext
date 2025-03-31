@@ -7,6 +7,7 @@ from eth_typing import HexStr
 from eth_abi import encode as encode_abi
 
 from .utils import fill_nonce, fill_gas_price, fill_chain_id
+from .batch import to_batch_aware_method
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -57,7 +58,8 @@ class NotBoundContractFunction:
     def __getitem__(self, signature: FunctionSignature):
         fn = AsyncContractFunction.factory(
             self.name, w3=self.chain, address=self.address,
-            abi=self._get_abi(signature), function_identifier=self.name
+            abi=(abi:=self._get_abi(signature)), fn_name=self.name,
+            contract_abi=[abi]
         )
         return ContractFunction(fn, self.chain)
 
@@ -74,7 +76,7 @@ class ContractFunction:
     async def transact(self, *args, **kwargs):
         tx, account = await self._build_transaction(*args, **kwargs)
         return await self._chain.eth.send_raw_transaction(
-            account.sign_transaction(tx).rawTransaction
+            account.sign_transaction(tx).raw_transaction
         )
 
     async def _build_transaction(self, *args, **kwargs):
@@ -95,6 +97,9 @@ class ContractFunction:
 
     def __getattr__(self, name) -> Any:
         return getattr(self.__function, name)
+
+    async def call(self, *args, **kwargs):
+        return await to_batch_aware_method(self._chain, self.__function.call)(*args, **kwargs)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.__class__(self.__function(*args, **kwargs), self._chain)

@@ -1,7 +1,8 @@
 # pylint: disable=no-name-in-module
 import json
 from cytoolz.dicttoolz import assoc
-from typing import Any, Callable, Collection, Union, cast, TYPE_CHECKING, Optional
+from contextvars import ContextVar
+from typing import Any, Callable, Collection, Union, cast, TYPE_CHECKING, Optional, Dict
 
 import aiohttp
 from eth_account.signers.local import LocalAccount
@@ -9,9 +10,10 @@ from eth_keys.datatypes import PrivateKey
 from eth_typing import ChecksumAddress, HexStr
 from eth_utils.toolz import curry
 from eth_utils.crypto import keccak
-from web3 import AsyncWeb3
+from web3 import AsyncWeb3, Web3
+from web3.middleware import Web3Middleware
 from web3.middleware.signing import format_transaction, gen_normalized_accounts
-from web3.types import AsyncMiddleware, RPCEndpoint, RPCResponse, TxParams, AsyncMiddlewareCoroutine
+from web3.types import RPCEndpoint, RPCResponse, TxParams
 try:
     from web3._utils.async_transactions import async_fill_transaction_defaults
 except ImportError:
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
 _PrivateKey = Union[LocalAccount, PrivateKey, HexStr, bytes]
 
 to_checksum_address = AsyncWeb3.to_checksum_address
+_batch_request_processed = ContextVar[bool]('_batch_request_processed', default=False)
 
 
 async def load_abi(filename: str, process: Optional[Callable] = None) -> str:
@@ -80,9 +83,42 @@ async def fill_nonce(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> 
     return transaction
 
 
+class AsyncSignSendRawMiddleware(Web3Middleware):
+    def __init__(self, w3: AsyncWeb3, accounts: Dict[ChecksumAddress, LocalAccount]) -> None:
+        super().__init__(w3)
+        self._accounts = accounts
+
+    async def async_wrap_make_request(self, make_request):
+        async def middleware(method: RPCEndpoint, params: Any) -> RPCResponse:
+            if method != 'eth_sendTransaction':
+                return await make_request(method, params)
+
+            transaction = params[0]
+            transaction = await fill_chain_id(self._w3, transaction)
+            transaction = await fill_nonce(self._w3, transaction)
+            transaction = await async_fill_transaction_defaults(self._w3, transaction)
+            transaction = await fill_gas_price(self._w3, transaction)
+            transaction = format_transaction(transaction)
+
+            if 'from' not in transaction:
+                return await make_request(method, params)
+
+            if transaction.get('from') not in self._accounts:
+                return await make_request(method, params)
+
+            # pylint: disable=unsubscriptable-object
+            account = self._accounts[transaction['from']]
+            raw_tx = account.sign_transaction(transaction).rawTransaction
+
+            return await make_request(RPCEndpoint('eth_sendRawTransaction'),
+                                      [AsyncWeb3.to_hex(raw_tx)])
+
+        return middleware
+
+
 def construct_async_sign_and_send_raw_middleware(
     private_key_or_account: Union[_PrivateKey, Collection[_PrivateKey]]
-) -> AsyncMiddleware:
+) -> Callable[[AsyncWeb3], AsyncSignSendRawMiddleware]:
     """Capture transactions sign and send as raw transactions
 
     Keyword arguments:
@@ -94,38 +130,9 @@ def construct_async_sign_and_send_raw_middleware(
     """
 
     accounts = gen_normalized_accounts(private_key_or_account)
-
-    async def sign_and_send_raw_middleware(
-        make_request: Callable[[RPCEndpoint, Any], Any],
-        _async_w3: 'AsyncWeb3'
-    ) -> AsyncMiddlewareCoroutine:
-
-        async def middleware(method: RPCEndpoint, params: Any) -> RPCResponse:
-            if method != 'eth_sendTransaction':
-                return await make_request(method, params)
-
-            transaction = params[0]
-            transaction = await fill_chain_id(_async_w3, transaction)
-            transaction = await fill_nonce(_async_w3, transaction)
-            transaction = await async_fill_transaction_defaults(_async_w3, transaction)
-            transaction = await fill_gas_price(_async_w3, transaction)
-            transaction = format_transaction(transaction)
-
-            if 'from' not in transaction:
-                return await make_request(method, params)
-
-            if transaction.get('from') not in accounts:
-                return await make_request(method, params)
-
-            # pylint: disable=unsubscriptable-object
-            account = accounts[transaction['from']]
-            raw_tx = account.sign_transaction(transaction).rawTransaction
-
-            return await make_request(RPCEndpoint('eth_sendRawTransaction'), [AsyncWeb3.to_hex(raw_tx)])
-
-        return middleware
-
-    return sign_and_send_raw_middleware
+    def middleware(w3: AsyncWeb3 | Web3):
+        return AsyncSignSendRawMiddleware(w3, accounts)
+    return middleware
 
 
 def keccak256(value: Union[str, bytes]) -> str:
