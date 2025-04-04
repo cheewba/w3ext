@@ -1,5 +1,6 @@
 # pylint: disable=no-name-in-module
 import asyncio
+import logging
 import time
 from contextvars import ContextVar
 from functools import wraps
@@ -11,6 +12,8 @@ from web3.method import Method, RPC_METHODS_UNSUPPORTED_DURING_BATCH
 
 if TYPE_CHECKING:
     from .chain import Chain
+
+logger = logging.getLogger(__name__)
 
 
 _batch_request_processed = ContextVar[bool]('_batch_request_processed', default=False)
@@ -67,7 +70,7 @@ class Batch:
         max_size: int = None,
         max_wait: float = None
     ) -> None:
-        self._futures = []
+        self._requests = []
         self._max_size = max_size
         self._max_wait = max_wait
         self._web3 = web3
@@ -78,12 +81,10 @@ class Batch:
         self._lock = asyncio.Lock()
 
     async def _add_request_info(self, request_info):
-        async def wrapper():
-            return request_info
-
         (req := asyncio.Future()).set_result(request_info)
-        self._batcher.add(req)
-        self._futures.append(fut := asyncio.Future())
+        async with self._lock:
+            # self._batcher.add(req)
+            self._requests.append((req, fut := asyncio.Future()))
         if self._batch_started is None:
             self._batch_started = time.time()
         return await fut
@@ -94,51 +95,65 @@ class Batch:
             await self._validate_batching()
 
     async def _validate_batching(self, cancel: bool = False):
-        if self._batcher is not None:
-            if (cancel
-                    or (self._max_size and len(self._futures) >= self._max_size)
-                    or (self._max_wait
-                            and self._batch_started
-                            and time.time() - self._batch_started >= self._max_wait)):
-                await self._process_batch()
-                await self._batcher.__aexit__(None, None, None)
-
-                self._batcher = None
-                self._batch_started = None
-
-        if not cancel and self._batcher is None:
-            self._batcher = self._web3.batch_requests()
-            await self._batcher.__aenter__()
+        async with self._lock:
+            if self._batcher is not None:
+                if (cancel
+                        or (self._max_size and len(self._requests) >= self._max_size)
+                        or (self._max_wait
+                                and self._batch_started
+                                and time.time() - self._batch_started >= self._max_wait)):
+                    await self._process_batch()
+                    self._batch_started = None
 
     async def __aenter__(self):
-        await self._validate_batching()
+        if self._batcher is None:
+            # dummy batcher to say web3 think it's in a batch mode
+            self._batcher = self._web3.batch_requests()
+            await self._batcher.__aenter__()
         self._validator = asyncio.create_task(self._validator_task())
         return self
 
     async def __aexit__(self, *args, **kwargs):
         if self._validator:
             self._validator.cancel()
-        await self._validate_batching(cancel=True)
+        if self._batcher is not None:
+            await self._validate_batching(cancel=True)
+            await self._batcher.__aexit__(None, None, None)
+            self._batcher = None
 
     async def _process_batch(self):
-        if not len(self._futures):
-            return
+        semaphore = asyncio.Semaphore(3)
+        async def process(requests, futures):
+            batcher = self._web3.batch_requests()
+            for request in requests:
+                batcher.add(request)
 
-        try:
-            # Execute batch
-            responses = await self._batcher.async_execute()
+            try:
+                # Execute batch
+                async with semaphore:
+                    responses = await batcher.async_execute()
+                    # unfortunately, each request processing switch batching flag to false
+                    # in web3py, so we have to activate it again manually.
+                    # otherwise all upcoming requests will be processed by provider directly,
+                    # instead of providing just requests info
+                    await self._batcher.__aenter__()
+                # Process results
+                for future, response in zip(futures, responses):
+                    if isinstance(response, Exception):
+                        future.set_exception(response)
+                    else:
+                        future.set_result(response)
+            except Exception as e:
+                # If batch fails, fail all futures
+                logger.exception(e)
+                for future in futures:
+                    if not future.done():
+                        future.set_exception(e)
 
-            # Process results
-            for future, response in zip(self._futures, responses):
-                if isinstance(response, Exception):
-                    future.set_exception(response)
-                else:
-                    future.set_result(response)
+        tasks = []
+        while len(self._requests):
+            requests, futures = list(zip(*self._requests[:self._max_size]))
+            self._requests = self._requests[len(requests):]
+            tasks.append(process(requests, futures))
 
-        except Exception as e:
-            # If batch fails, fail all futures
-            for future in self._futures:
-                if not future.done():
-                    future.set_exception(e)
-
-        self._futures = []
+        await asyncio.gather(*tasks)
