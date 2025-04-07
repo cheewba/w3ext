@@ -1,7 +1,6 @@
 # pylint: disable=no-name-in-module
 import json
 from cytoolz.dicttoolz import assoc
-from contextvars import ContextVar
 from typing import Any, Callable, Collection, Union, cast, TYPE_CHECKING, Optional, Dict
 
 import aiohttp
@@ -26,7 +25,6 @@ if TYPE_CHECKING:
 _PrivateKey = Union[LocalAccount, PrivateKey, HexStr, bytes]
 
 to_checksum_address = AsyncWeb3.to_checksum_address
-_batch_request_processed = ContextVar[bool]('_batch_request_processed', default=False)
 
 
 async def load_abi(filename: str, process: Optional[Callable] = None) -> str:
@@ -108,7 +106,7 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
 
             # pylint: disable=unsubscriptable-object
             account = self._accounts[transaction['from']]
-            raw_tx = account.sign_transaction(transaction).rawTransaction
+            raw_tx = account.sign_transaction(transaction).raw_transaction
 
             return await make_request(RPCEndpoint('eth_sendRawTransaction'),
                                       [AsyncWeb3.to_hex(raw_tx)])
