@@ -6,7 +6,7 @@ from web3.contract.async_contract import AsyncContract, AsyncContractFunction
 from eth_typing import HexStr
 from eth_abi import encode as encode_abi
 
-from .utils import fill_nonce, fill_gas_price, fill_chain_id
+from .utils import fill_nonce, fill_gas_price, fill_chain_id, to_checksum_address
 from .batch import to_batch_aware_method
 
 if TYPE_CHECKING:
@@ -68,6 +68,10 @@ class ContractFunction:
     def __init__(self, function: AsyncContractFunction, chain: "Chain") -> None:
         self.__function = function
         self._chain = chain
+
+    @property
+    def chain(self) -> "Chain":
+        return self._chain
 
     async def build_transaction(self, *args, **kwargs):
         tx, _ = await self._build_transaction(*args, **kwargs)
@@ -132,6 +136,11 @@ class Contract:
     @property
     def chain_id(self) -> str:
         return self.__chain.chain_id
+
+    @property
+    def address(self) -> str:
+        return (self.__contract.address if isinstance(self.__contract, AsyncContract)
+                else to_checksum_address(self.__contract))
 
     def __getattr__(self, name) -> Any:
         # let use token as a contract with predefined ABI and web3 instance
