@@ -105,7 +105,7 @@ class Chain:
         return self._batcher is not None
 
     @asynccontextmanager
-    async def use_batch(self, max_size: int = None, max_wait: float = None):
+    async def use_batch(self, max_size: int = 20, max_wait: float = 0.1):
         try:
             async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
                 self._batcher = batcher

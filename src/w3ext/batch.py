@@ -67,8 +67,8 @@ class Batch:
         self,
         web3: AsyncWeb3,
         *,
-        max_size: int = None,
-        max_wait: float = None
+        max_size: int = 20,
+        max_wait: float = 0.1
     ) -> None:
         self._requests = []
         self._max_size = max_size
