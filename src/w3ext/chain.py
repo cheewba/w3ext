@@ -2,6 +2,8 @@
 import asyncio
 import os
 from contextlib import ExitStack, asynccontextmanager
+from collections import deque
+from functools import wraps
 from typing import Optional, Any, Union, cast, Type
 
 from eth_typing import HexAddress, ChecksumAddress
@@ -42,6 +44,24 @@ class AsyncEthProxy:
         value = getattr(self._eth, name)
         if is_batch_method(self._eth, name):
             return to_batch_aware_method(self._chain, value)
+
+        # If the attribute is callable, we want to rebind it so that within its body,
+        # self will resolve via our proxy.
+        if callable(value):
+            # If the attribute is a classmethod, then it will be a 'classmethod' descriptor.
+            # We detect that and use its __get__ to bind it properly.
+            if isinstance(value, classmethod):
+                # Bind the class method on the proxy (so that inside it, "cls" becomes proxy's type or proxy itself).
+                return value.__get__(self, type(self))
+
+            # For normal methods, check if it's a bound method (i.e. has __func__)
+            if hasattr(value, '__func__'):
+                # Return a wrapper that calls the underlying unbound function with self replaced by the proxy.
+                @wraps(value)
+                def wrapper(*args, **kwargs):
+                    return value.__func__(self, *args, **kwargs)
+                return wrapper
+
         return value
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -81,8 +101,7 @@ class Chain:
         self.scan = scan
         self.name = name
 
-        self._batcher = None
-        self._batcher_requests = None
+        self._batchers = deque()
 
     @classmethod
     async def connect(
@@ -102,19 +121,24 @@ class Chain:
 
     @property
     def _is_batching(self):
-        return self._batcher is not None
+        return len(self._batchers) > 0
 
     @asynccontextmanager
     async def use_batch(self, max_size: int = 20, max_wait: float = 0.1):
+        added = False
         try:
             async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
-                self._batcher = batcher
+                self._batchers.append(batcher)
+                added = True
                 yield batcher
         finally:
-            self._batcher = None
+            if added:
+                self._batchers.pop()
+            # hack to be sure the batching is still on
+            self.__web3.provider._is_batching = len(self._batchers) > 0
 
     async def _add_to_batch_request_info(self, request_info):
-        return await self._batcher._add_request_info(request_info)
+        return await self._batchers[-1]._add_request_info(request_info)
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)

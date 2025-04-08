@@ -22,16 +22,19 @@ _batch_request_processed = ContextVar[bool]('_batch_request_processed', default=
 def to_batch_aware_method(chain: "Chain", method: Callable):
     @wraps(method)
     async def wrapper(*args, **kwargs):
-        result = await method(*args, **kwargs)
         if chain._is_batching and not _batch_request_processed.get():
             # in case of batching, we need to collect all calls to batch.
             # instead of returning request data, return future
-            _batch_request_processed.set(True)
+            token = _batch_request_processed.set(True)
             try:
-                return await chain._add_to_batch_request_info(result)
+                return await chain._add_to_batch_request_info(
+                    await method(*args, **kwargs)
+                )
             finally:
-                _batch_request_processed.set(False)
-        return result
+                _batch_request_processed.reset(token)
+
+        return await method(*args, **kwargs)
+
     return wrapper
 
 
