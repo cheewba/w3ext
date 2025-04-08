@@ -1,4 +1,5 @@
 # pylint: disable=no-name-in-module
+from numbers import Number
 from typing import Optional, Any, Union, TYPE_CHECKING, Self, cast
 
 from eth_typing import HexAddress
@@ -36,6 +37,10 @@ class Currency:
         return self.symbol or self.name
     def __repr__(self) -> str:
         return str(self)
+    def __hash__(self) -> int:
+        return hash(self.name + self.symbol)
+    def __eq__(self, value: Self) -> bool:
+        return hash(self) == hash(value)
 
 
 class Token(Currency):
@@ -97,6 +102,8 @@ class Token(Currency):
     def __getattr__(self, name) -> Any:
         # let use token as a contract with predefined ABI and web3 instance
         return getattr(self.contract, name)
+    def __hash__(self) -> int:
+        return hash(self.chain_id + ":" + to_checksum_address(self.address))
 
 
 class CurrencyAmount:
@@ -125,43 +132,47 @@ class CurrencyAmount:
         return self._new_amount(self.amount - self._to_amount(other).amount)
     __rsub__ = __sub__
 
-    def __mul__(self: Self, other: Self) -> Self:
+    def __mul__(self: Self, other: Union[Self, Number]) -> Self:
+        if isinstance(other, Number):
+            return self._new_amount(int(self.amount * other))
         return self._new_amount(int(self.amount * self._to_amount(other).amount / 10 ** other.currency.decimals))
     __rmul__ = __mul__
 
-    def __div__(self: Self, other: Self) -> Self:
+    def __truediv__(self: Self, other: Self) -> Self:
+        if isinstance(other, Number):
+            return self._new_amount(int(self.amount / other))
         return self._new_amount(int(self.amount / self._to_amount(other).amount / 10 ** other.currency.decimals))
-    __rdiv__ = __div__
+    __rtruediv__ = __truediv__
 
     def __gt__(self: Self, other: Self) -> bool:
-        if isinstance(other, self.__class__):
+        if isinstance(other, CurrencyAmount):
             return self.amount > other.amount
-        return False
+        raise TypeError(f"Can't compare {self.__class__.__name__} and {type(other)}")
 
     def __lt__(self: Self, other: Self) -> bool:
-        if isinstance(other, self.__class__):
+        if isinstance(other, CurrencyAmount):
             return self.amount < other.amount
-        return False
+        raise TypeError(f"Can't compare {self.__class__.__name__} and {type(other)}")
 
     def __ge__(self: Self, other: Self) -> bool:
-        if isinstance(other, self.__class__):
+        if isinstance(other, CurrencyAmount):
             return self.amount >= other.amount
-        return False
+        raise TypeError(f"Can't compare {self.__class__.__name__} and {type(other)}")
 
     def __le__(self: Self, other: Self) -> bool:
-        if isinstance(other, self.__class__):
+        if isinstance(other, CurrencyAmount):
             return self.amount <= other.amount
-        return False
+        raise TypeError(f"Can't compare {self.__class__.__name__} and {type(other)}")
 
     def __eq__(self: Self, other: Self) -> bool:  # type: ignore[override]
-        if isinstance(other, self.__class__):
-            return self.amount == other.amount
+        if isinstance(other, CurrencyAmount):
+            return self.amount == other.amount and self.currency == other.currency
         return False
 
     def __ne__(self: Self, other: Self) -> bool:  # type: ignore[override]
-        if isinstance(other, self.__class__):
-            return self.amount != other.amount
-        return False
+        if isinstance(other, CurrencyAmount):
+            return self.amount != other.amount or self.currency != other.currency
+        return True
 
     def __str__(self) -> str:
         return f"{self.to_fixed()} {self.currency}"
