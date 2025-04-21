@@ -4,7 +4,7 @@ import logging
 import time
 from contextvars import ContextVar
 from functools import wraps
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING, Optional
 
 from web3 import AsyncWeb3
 from web3.method import Method, RPC_METHODS_UNSUPPORTED_DURING_BATCH
@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 _batch_request_processed = ContextVar[bool]('_batch_request_processed', default=False)
 
 
+def _dummy_checker(self):
+    pass
+
+
 def to_batch_aware_method(chain: "Chain", method: Callable):
     @wraps(method)
     async def wrapper(*args, **kwargs):
@@ -27,10 +31,12 @@ def to_batch_aware_method(chain: "Chain", method: Callable):
             # instead of returning request data, return future
             token = _batch_request_processed.set(True)
             try:
+                chain._web3.provider._is_batching = True
                 return await chain._add_to_batch_request_info(
                     await method(*args, **kwargs)
                 )
             finally:
+                chain._web3.provider._is_batching = False
                 _batch_request_processed.reset(token)
 
         return await method(*args, **kwargs)
@@ -71,11 +77,13 @@ class Batch:
         web3: AsyncWeb3,
         *,
         max_size: int = 20,
-        max_wait: float = 0.1
+        max_wait: float = 0.1,
+        timeout: Optional[float] = 60
     ) -> None:
         self._requests = []
         self._max_size = max_size
         self._max_wait = max_wait
+        self._timeout = timeout
         self._web3 = web3
 
         self._batcher = None
@@ -86,10 +94,12 @@ class Batch:
     async def _add_request_info(self, request_info):
         (req := asyncio.Future()).set_result(request_info)
         async with self._lock:
-            # self._batcher.add(req)
             self._requests.append((req, fut := asyncio.Future()))
         if self._batch_started is None:
             self._batch_started = time.time()
+
+        if self._timeout is not None:
+            return await asyncio.wait_for(fut, timeout=self._timeout)
         return await fut
 
     async def _validator_task(self):
@@ -99,35 +109,35 @@ class Batch:
 
     async def _validate_batching(self, cancel: bool = False):
         async with self._lock:
-            if self._batcher is not None:
-                if (cancel
-                        or (self._max_size and len(self._requests) >= self._max_size)
-                        or (self._max_wait
-                                and self._batch_started
-                                and time.time() - self._batch_started >= self._max_wait)):
-                    await self._process_batch()
-                    self._batch_started = None
+            # if self._batcher is not None:
+            if (cancel
+                    or (self._max_size and len(self._requests) >= self._max_size)
+                    or (self._max_wait
+                            and self._batch_started
+                            and time.time() - self._batch_started >= self._max_wait)):
+                await self._process_batch()
+                self._batch_started = None
 
     async def __aenter__(self):
-        if self._batcher is None:
-            # dummy batcher to say web3 think it's in a batch mode
-            self._batcher = self._web3.batch_requests()
-            await self._batcher.__aenter__()
         self._validator = asyncio.create_task(self._validator_task())
         return self
 
     async def __aexit__(self, *args, **kwargs):
         if self._validator:
             self._validator.cancel()
-        if self._batcher is not None:
-            await self._validate_batching(cancel=True)
-            await self._batcher.__aexit__(None, None, None)
-            self._batcher = None
+        await self._validate_batching(cancel=True)
 
     async def _process_batch(self):
         semaphore = asyncio.Semaphore(3)
         async def process(requests, futures):
+            # since we need standart web3 batching to generate requests info only
+            # reset _is_batching flag to the value we expect to see, instead of True
+            # to not break upgraded batching logic
+            # batching = self._web3.provider._is_batching
             batcher = self._web3.batch_requests()
+            # self._web3.provider._is_batching = batching
+            batcher._validate_is_batching = _dummy_checker.__get__(batcher, batcher.__class__)
+
             for request in requests:
                 batcher.add(request)
 
@@ -135,11 +145,6 @@ class Batch:
                 # Execute batch
                 async with semaphore:
                     responses = await batcher.async_execute()
-                    # unfortunately, each request processing switch batching flag to false
-                    # in web3py, so we have to activate it again manually.
-                    # otherwise all upcoming requests will be processed by provider directly,
-                    # instead of providing just requests info
-                    await self._batcher.__aenter__()
                 # Process results
                 for future, response in zip(futures, responses):
                     if isinstance(response, Exception):

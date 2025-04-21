@@ -2,12 +2,12 @@
 import asyncio
 import os
 from contextlib import ExitStack, asynccontextmanager
-from collections import deque
+from contextvars import ContextVar
 from functools import wraps
 from typing import Optional, Any, Union, cast, Type
 
 from eth_typing import HexAddress, ChecksumAddress
-from web3 import AsyncWeb3, AsyncHTTPProvider
+from web3 import AsyncWeb3 as _AsyncWeb3, AsyncHTTPProvider
 from web3.eth import AsyncEth
 from web3.providers import AsyncBaseProvider
 from web3.middleware import (
@@ -30,6 +30,8 @@ from .account import Account
 __all__ = ["Chain"]
 
 ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
+_batcher_var = ContextVar("_batcher_var", default=None)
+
 
 async def a_dummy(value):
     return value
@@ -51,7 +53,6 @@ class AsyncEthProxy:
             # If the attribute is a classmethod, then it will be a 'classmethod' descriptor.
             # We detect that and use its __get__ to bind it properly.
             if isinstance(value, classmethod):
-                # Bind the class method on the proxy (so that inside it, "cls" becomes proxy's type or proxy itself).
                 return value.__get__(self, type(self))
 
             # For normal methods, check if it's a bound method (i.e. has __func__)
@@ -65,19 +66,56 @@ class AsyncEthProxy:
         return value
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if  name not in ('_eth', '_chain'):
+        if name not in ('_eth', '_chain'):
             setattr(self._eth, name, value)
         super().__setattr__(name, value)
 
 
+def patch_provider(provider_instance, chain):
+    """
+    Dynamically creates a subclass of the provider's class that adds a property
+    _is_batching, then changes the instance's __class__ to that subclass.
+    """
+    # Save the original class
+    orig_cls = provider_instance.__class__
+
+    # Define a new subclass dynamically.
+    class PatchedProvider(orig_cls):
+        @property
+        def _is_batching(self):
+            # Custom getter: return whether _batcher_var indicates batching is active.
+            return chain._is_batching
+
+        @_is_batching.setter
+        def _is_batching(self, value):
+            # don't modify batching var
+            pass
+
+    # Change the instance's class to the new patched subclass.
+    provider_instance.__class__ = PatchedProvider
+    return provider_instance
+
+
+class AsyncWeb3(_AsyncWeb3):
+    def __init__(self, chain: "Chain", *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._chain = chain
+
+    def __getattribute__(self, name: str) -> Any:
+        value = super().__getattribute__(name)
+        if name == 'provider' and value.__class__.__name__ != "PatchedProvider":
+                value = patch_provider(value, self._chain)
+        return value
+
+
 class Chain:
-    _currency: 'Currency'
-    _chain_id: str
-    __web3: AsyncWeb3
-
-    _is_eip1559: Optional[bool] = None
-
-    scan: Optional[str]
+    _DEFAULT_MIDDLEWARE = [
+            GasPriceStrategyMiddleware,
+            AttributeDictMiddleware,
+            ValidationMiddleware,
+            BufferedGasEstimateMiddleware,
+            ExtraDataToPOAMiddleware,
+    ]
 
     def __init__(
         self,
@@ -86,22 +124,14 @@ class Chain:
         scan: Optional[str] = None,
         name: Optional[str] = None
     ) -> None:
-
-        self.__web3 = AsyncWeb3(middleware=[
-            GasPriceStrategyMiddleware,
-            AttributeDictMiddleware,
-            ValidationMiddleware,
-            BufferedGasEstimateMiddleware,
-            ExtraDataToPOAMiddleware,
-        ])
+        self.__web3 = AsyncWeb3(self, middleware=self._DEFAULT_MIDDLEWARE)
         self.__web3.eth = AsyncEthProxy(self.__web3.eth, self)
         self._chain_id = str(chain_id)
-
+        self._is_eip1559 = None
         self.currency = currency
         self.scan = scan
         self.name = name
-
-        self._batchers = deque()
+        self._abi_cache = {}
 
     @classmethod
     async def connect(
@@ -114,31 +144,31 @@ class Chain:
         name: Optional[str] = None,
         request_kwargs: Optional[dict] = None
     ) -> "Chain":
-        """ Convenient way to initialize Chain instance and connect to RPC. """
         instance = cls(chain_id, currency, scan, name)
         await instance.connect_rpc(rpc, request_kwargs)
         return instance
 
     @property
     def _is_batching(self):
-        return len(self._batchers) > 0
+        return self.batcher is not None
+
+    @property
+    def batcher(self):
+        return _batcher_var.get()
 
     @asynccontextmanager
     async def use_batch(self, max_size: int = 20, max_wait: float = 0.1):
-        added = False
+        token = None
         try:
             async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
-                self._batchers.append(batcher)
-                added = True
+                token = _batcher_var.set(batcher)
                 yield batcher
         finally:
-            if added:
-                self._batchers.pop()
-            # hack to be sure the batching is still on
-            self.__web3.provider._is_batching = len(self._batchers) > 0
+            if token:
+                _batcher_var.reset(token)
 
     async def _add_to_batch_request_info(self, request_info):
-        return await self._batchers[-1]._add_request_info(request_info)
+        return await self.batcher._add_request_info(request_info)
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
@@ -157,7 +187,6 @@ class Chain:
 
     @property
     def _web3(self) -> AsyncWeb3:
-        """ AsyncWeb3 instance, for internal use only. """
         return self.__web3
 
     @property
@@ -166,20 +195,16 @@ class Chain:
 
     @currency.setter
     def currency(self, currency: Union['Currency', str]):
-        self._currency = (currency if isinstance(currency, Currency)
-                          else Currency(currency, currency))
+        self._currency = currency if isinstance(currency, Currency) else Currency(currency, currency)
 
     @property
     def chain_id(self):
         return self._chain_id
 
     async def _get_abi(self, name):
-        key = f'_{name}_abi'
-        abi = getattr(self, key, None)
-        if not abi:
-            abi = await self._load_abi(f'{name}.json')
-            setattr(self, key, abi)
-        return abi
+        if name not in self._abi_cache:
+            self._abi_cache[name] = await self._load_abi(f'{name}.json')
+        return self._abi_cache[name]
 
     async def _load_abi(self, name) -> Any:
         return await load_abi(os.path.join(ABI_PATH, name))
@@ -191,7 +216,7 @@ class Chain:
         return await self._get_abi('erc721')
 
     async def is_eip1559(self) -> bool:
-        if (self._is_eip1559 is None):
+        if self._is_eip1559 is None:
             self._is_eip1559 = await is_eip1559(self._web3)
         return self._is_eip1559
 
@@ -204,13 +229,15 @@ class Chain:
     ) -> Optional['Token']:
         token_contract = self.contract(contract, abi=abi or await self.erc20_abi())
 
-        name, symbol, decimals = await asyncio.gather(*[
+        tasks = [
             getattr(token_contract.functions, key)().call()
-            if (val := kwargs.get(key, None)) is None else a_dummy(val)
+            if (val := kwargs.get(key)) is None else a_dummy(val)
             for key in ['name', 'symbol', 'decimals']
-        ])
+        ]
+        name, symbol, decimals = await asyncio.gather(*tasks)
+
         token = Token(token_contract, name, symbol, decimals)
-        if (cache_as is not None):
+        if cache_as is not None:
             setattr(self, cache_as, token)
         return token
 
@@ -223,7 +250,7 @@ class Chain:
         token_contract = self.contract(contract, abi=abi or await self.erc721_abi())
         name = await token_contract.functions.name().call()
         collection = Nft721Collection(token_contract, name)
-        if (cache_as is not None):
+        if cache_as is not None:
             setattr(self, cache_as, collection)
         return collection
 
@@ -242,7 +269,7 @@ class Chain:
         return CurrencyAmount(self.currency, amount)
 
     async def get_nonce(self, address: HexAddress) -> int:
-        return await self.eth.get_transaction_count(  # type: ignore
+        return await self.eth.get_transaction_count(
             cast(ChecksumAddress, address)
         )
 
@@ -268,22 +295,24 @@ class Chain:
 
     def contract(self, address: HexAddress, abi: Optional[Any] = None) -> 'Contract':
         address = to_checksum_address(address)
-        contract = (self._web3.eth.contract(address, abi=abi)
-                    if abi is not None else address)
+        contract = (
+            self._web3.eth.contract(address, abi=abi)
+            if abi is not None else address
+        )
         return Contract(contract, self)
 
     def get_tx_scan(self, tx_hash: HexBytes):
         if not self.scan:
             return tx_hash
-        hash = tx_hash.hex()
-        if not hash.startswith('0x'):
-            hash = f"0x{hash}"
-        return '/'.join([self.scan if not self.scan.endswith('/') else self.scan[:-1], 'tx', hash])
+        hash_str = tx_hash.hex()
+        if not hash_str.startswith('0x'):
+            hash_str = f"0x{hash_str}"
+        scan_base = self.scan[:-1] if self.scan.endswith('/') else self.scan
+        return f"{scan_base}/tx/{hash_str}"
 
     def __getattr__(self, name) -> Any:
         if name == self.currency.symbol:
             return self.currency
-        # let use token as a contract with predefined ABI and web3 instance
         return getattr(self._web3, name)
 
     def __str__(self) -> str:
