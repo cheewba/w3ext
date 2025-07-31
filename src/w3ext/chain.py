@@ -1,10 +1,18 @@
 # pylint: disable=no-name-in-module
+"""
+Chain module for w3ext library.
+
+This module provides the Chain class, which is the central component for interacting
+with Ethereum-compatible blockchains. It extends web3.py functionality with enhanced
+features like batch operations, automatic token/NFT loading, and simplified account management.
+"""
+
 import asyncio
 import os
 from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, Any, Union, cast, Type
+from typing import Optional, Any, Union, cast, Type, Dict, List
 
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3 as _AsyncWeb3, AsyncHTTPProvider
@@ -109,6 +117,28 @@ class AsyncWeb3(_AsyncWeb3):
 
 
 class Chain:
+    """
+    Central component for blockchain interaction in w3ext.
+
+    The Chain class provides a high-level interface for interacting with Ethereum-compatible
+    blockchains. It extends web3.py functionality with enhanced features like batch operations,
+    automatic token/NFT loading, and simplified account management.
+
+    Features:
+    - Automatic RPC connection management
+    - Built-in support for ERC20 tokens and ERC721 NFTs
+    - Batch operation support for improved performance
+    - EIP-1559 transaction support detection
+    - Integrated block explorer URL generation
+    - ABI caching for common contract types
+
+    Attributes:
+        currency (Currency): The native currency of the chain (e.g., ETH, BNB)
+        scan (str, optional): Base URL for block explorer
+        name (str, optional): Human-readable name of the chain
+        chain_id (str): The chain ID as a string
+    """
+
     _DEFAULT_MIDDLEWARE = [
             GasPriceStrategyMiddleware,
             AttributeDictMiddleware,
@@ -124,14 +154,31 @@ class Chain:
         scan: Optional[str] = None,
         name: Optional[str] = None
     ) -> None:
-        self.__web3 = AsyncWeb3(self, middleware=self._DEFAULT_MIDDLEWARE)
+        """
+        Initialize a Chain instance.
+
+        Args:
+            chain_id: The blockchain's chain ID (e.g., 1 for Ethereum mainnet)
+            currency: The native currency symbol or Currency object (default: 'ETH')
+            scan: Base URL for block explorer (e.g., 'https://etherscan.io')
+            name: Human-readable name for the chain (e.g., 'Ethereum Mainnet')
+
+        Note:
+            This constructor creates an unconnected Chain instance. Use Chain.connect()
+            class method to create a connected instance, or call connect_rpc() afterwards.
+        """
+        # Internal AsyncWeb3 instance with custom middleware
+        self.__web3: AsyncWeb3 = AsyncWeb3(self, middleware=self._DEFAULT_MIDDLEWARE)
         self.__web3.eth = AsyncEthProxy(self.__web3.eth, self)
-        self._chain_id = str(chain_id)
-        self._is_eip1559 = None
+        # Chain ID stored as string for consistency
+        self._chain_id: str = str(chain_id)
+        # Cached EIP-1559 support detection result
+        self._is_eip1559: Optional[bool] = None
         self.currency = currency
         self.scan = scan
         self.name = name
-        self._abi_cache = {}
+        # Cache for loaded ABI files to avoid repeated disk reads
+        self._abi_cache: Dict[str, Any] = {}
 
     @classmethod
     async def connect(
@@ -144,6 +191,34 @@ class Chain:
         name: Optional[str] = None,
         request_kwargs: Optional[dict] = None
     ) -> "Chain":
+        """
+        Create and connect a Chain instance to an RPC endpoint.
+
+        This is the recommended way to create a Chain instance as it automatically
+        establishes the RPC connection and verifies the chain ID.
+
+        Args:
+            rpc: RPC endpoint URL (e.g., 'https://mainnet.infura.io/v3/PROJECT_ID')
+            chain_id: Expected chain ID for verification
+            currency: Native currency symbol or Currency object (default: 'ETH')
+            scan: Block explorer base URL (optional)
+            name: Human-readable chain name (optional)
+            request_kwargs: Additional HTTP request parameters (optional)
+
+        Returns:
+            Connected Chain instance ready for use
+
+        Raises:
+            ChainException: If the actual chain ID doesn't match the expected one
+
+        Example:
+            >>> chain = await Chain.connect(
+            ...     rpc="https://mainnet.infura.io/v3/YOUR_PROJECT_ID",
+            ...     chain_id=1,
+            ...     name="Ethereum Mainnet",
+            ...     scan="https://etherscan.io"
+            ... )
+        """
         instance = cls(chain_id, currency, scan, name)
         await instance.connect_rpc(rpc, request_kwargs)
         return instance
@@ -158,6 +233,27 @@ class Chain:
 
     @asynccontextmanager
     async def use_batch(self, max_size: int = 20, max_wait: float = 0.1):
+        """
+        Context manager for batch operations to improve performance.
+
+        Batches multiple blockchain calls together to reduce the number of RPC requests.
+        This is particularly useful when making many contract calls or balance queries.
+
+        Args:
+            max_size: Maximum number of requests per batch (default: 20)
+            max_wait: Maximum time to wait before sending a batch in seconds (default: 0.1)
+
+        Yields:
+            Batch: The batch manager instance
+
+        Example:
+            >>> async with chain.use_batch(max_size=10, max_wait=0.1):
+            ...     balances = await asyncio.gather(
+            ...         token1.get_balance(address1),
+            ...         token2.get_balance(address2),
+            ...         token3.get_balance(address3)
+            ...     )
+        """
         token = None
         try:
             async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
@@ -225,13 +321,58 @@ class Chain:
         contract: HexAddress, *,
         cache_as: Optional[str] = None,
         abi: Optional[Any] = None,
+        name: Optional[str] = None,
+        symbol: Optional[str] = None,
+        decimals: Optional[int] = None,
         **kwargs
     ) -> Optional['Token']:
+        """
+        Load an ERC20 token contract and create a Token instance.
+
+        Automatically fetches token metadata (name, symbol, decimals) from the contract
+        and creates a Token instance for easy interaction.
+
+        Args:
+            contract: Token contract address
+            cache_as: Attribute name to cache the token on this Chain instance (optional)
+            abi: Custom ABI to use instead of standard ERC20 ABI (optional)
+            name: Token name override (e.g., "USD Coin") - if provided, skips RPC call
+            symbol: Token symbol override (e.g., "USDC") - if provided, skips RPC call
+            decimals: Token decimals override (e.g., 6) - if provided, skips RPC call
+            **kwargs: Additional keyword arguments (for future extensibility)
+
+        Returns:
+            Token instance ready for use
+
+        Note:
+            If all three metadata fields (name, symbol, decimals) are provided,
+            no RPC requests will be made to fetch token metadata from the contract.
+
+        Example:
+            >>> # Load USDC token with automatic metadata fetching
+            >>> usdc = await chain.load_token(
+            ...     "0xA0b86a33E6441b8e776f1b0b8c8e6e8b8e8e8e8e",
+            ...     cache_as="usdc"
+            ... )
+            >>> # Load token with predefined metadata (no RPC calls)
+            >>> custom_token = await chain.load_token(
+            ...     "0x...",
+            ...     name="Custom Token",
+            ...     symbol="CTK",
+            ...     decimals=18
+            ... )
+            >>> # Now accessible as chain.usdc
+            >>> balance = await chain.usdc.get_balance(address)
+        """
         token_contract = self.contract(contract, abi=abi or await self.erc20_abi())
+
+        # Combine explicit parameters with kwargs for backward compatibility
+        metadata = {'name': name, 'symbol': symbol, 'decimals': decimals}
+        metadata.update(kwargs)
 
         tasks = [
             getattr(token_contract.functions, key)().call()
-            if (val := kwargs.get(key)) is None else a_dummy(val)
+            if (val := metadata.get(key)) is None else a_dummy(val)
             for key in ['name', 'symbol', 'decimals']
         ]
         name, symbol, decimals = await asyncio.gather(*tasks)
@@ -247,6 +388,29 @@ class Chain:
         cache_as: Optional[str] = None,
         abi: Optional[Any] = None
     ) -> Optional['Nft721Collection']:
+        """
+        Load an ERC721 NFT collection contract and create an Nft721Collection instance.
+
+        Automatically fetches the collection name from the contract and creates
+        an Nft721Collection instance for easy NFT interaction.
+
+        Args:
+            contract: NFT collection contract address
+            cache_as: Attribute name to cache the collection on this Chain instance (optional)
+            abi: Custom ABI to use instead of standard ERC721 ABI (optional)
+
+        Returns:
+            Nft721Collection instance ready for use
+
+        Example:
+            >>> # Load CryptoPunks collection
+            >>> punks = await chain.load_nft721(
+            ...     "0xb47e3cd837dDF8e4c57F05d70Ab865de6e193BBB",
+            ...     cache_as="cryptopunks"
+            ... )
+            >>> # Get owned NFTs
+            >>> owned = await chain.cryptopunks.get_owned_by(address)
+        """
         token_contract = self.contract(contract, abi=abi or await self.erc721_abi())
         name = await token_contract.functions.name().call()
         collection = Nft721Collection(token_contract, name)
@@ -259,6 +423,26 @@ class Chain:
         address: Union[HexAddress, "Account"],
         token: Optional[Token] = None
     ) -> 'CurrencyAmount':
+        """
+        Get the balance of native currency or a specific token for an address.
+
+        Args:
+            address: Wallet address or Account instance to check balance for
+            token: Specific Token instance to check balance for (optional)
+                  If None, returns native currency balance (e.g., ETH)
+
+        Returns:
+            CurrencyAmount representing the balance with proper decimal handling
+
+        Example:
+            >>> # Get ETH balance
+            >>> eth_balance = await chain.get_balance("0x...")
+            >>> print(f"ETH Balance: {eth_balance}")
+
+            >>> # Get token balance
+            >>> usdc_balance = await chain.get_balance("0x...", usdc_token)
+            >>> print(f"USDC Balance: {usdc_balance}")
+        """
         if isinstance(address, Account):
             address = address.address
         if token is not None:
