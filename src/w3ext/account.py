@@ -39,7 +39,6 @@ except ImportError:
     def encode_typed_data(*args, full_message: dict, **kwargs) -> SignableMessage:
         return encode_structured_data(full_message)
 
-
 from .token import Token
 if TYPE_CHECKING:
     from .chain import Chain
