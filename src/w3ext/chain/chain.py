@@ -12,7 +12,7 @@ import os
 from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, Any, Union, cast, Type, Dict, List
+from typing import Optional, Any, Union, cast, Type, Dict
 
 from eth_typing import HexAddress, ChecksumAddress
 from web3 import AsyncWeb3 as _AsyncWeb3, AsyncHTTPProvider
@@ -27,17 +27,17 @@ from web3.middleware import (
 )
 from web3.types import HexBytes, TxParams, HexStr, TxReceipt
 
-from .contract import Contract
-from .exceptions import ChainException
-from .token import Currency, Token, CurrencyAmount
-from .nft import Nft721Collection
-from .utils import is_eip1559, load_abi, to_checksum_address
-from .batch import Batch, is_batch_method, to_batch_aware_method
-from .account import Account
+from .chainlist import get_chain_provider
+from ..contract import Contract
+from ..exceptions import ChainException
+from ..token import Currency, Token, CurrencyAmount
+from ..nft import Nft721Collection
+from ..utils import is_eip1559, load_abi, to_checksum_address
+from ..batch import Batch, is_batch_method, to_batch_aware_method
+from ..account import Account
 
-__all__ = ["Chain"]
 
-ABI_PATH = os.path.join(os.path.dirname(__file__), 'abi')
+ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'abi')
 _batcher_var = ContextVar("_batcher_var", default=None)
 
 
@@ -152,7 +152,9 @@ class Chain:
         chain_id: Union[str, int],
         currency: Union[str, 'Currency'] = 'ETH',
         scan: Optional[str] = None,
-        name: Optional[str] = None
+        name: Optional[str] = None,
+        *,
+        request_kwargs: Optional[dict] = None
     ) -> None:
         """
         Initialize a Chain instance.
@@ -168,15 +170,22 @@ class Chain:
             class method to create a connected instance, or call connect_rpc() afterwards.
         """
         # Internal AsyncWeb3 instance with custom middleware
-        self.__web3: AsyncWeb3 = AsyncWeb3(self, middleware=self._DEFAULT_MIDDLEWARE)
+        # Initialize with a dummy provider to prevent AutoProvider from probing IPC/localhost
+        self.__web3: AsyncWeb3 = AsyncWeb3(
+            self,
+            middleware=self._DEFAULT_MIDDLEWARE,
+            provider=get_chain_provider(chain_id, request_kwargs)
+        )
         self.__web3.eth = AsyncEthProxy(self.__web3.eth, self)
         # Chain ID stored as string for consistency
         self._chain_id: str = str(chain_id)
         # Cached EIP-1559 support detection result
         self._is_eip1559: Optional[bool] = None
+
         self.currency = currency
         self.scan = scan
         self.name = name
+
         # Cache for loaded ABI files to avoid repeated disk reads
         self._abi_cache: Dict[str, Any] = {}
 
@@ -277,8 +286,16 @@ class Chain:
         rpc: Union[str, AsyncBaseProvider],
         request_kwargs: Optional[dict] = None
     ) -> None:
-        self.__web3.provider = (rpc if isinstance(rpc, AsyncBaseProvider) else
-                                AsyncHTTPProvider(rpc, request_kwargs))
+        if isinstance(rpc, AsyncBaseProvider):
+            provider = rpc
+        else:
+            # Ensure a default timeout of 30 seconds if not explicitly provided
+            if request_kwargs is None:
+                request_kwargs = {}
+            request_kwargs.setdefault("timeout", 60)
+            provider = AsyncHTTPProvider(rpc, request_kwargs)
+
+        self.__web3.provider = provider
         await self._verify_chain_id(self.chain_id)
 
     @property

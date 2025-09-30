@@ -320,10 +320,11 @@ class Batch:
                     responses = await batcher.async_execute()
                 # Process results
                 for future, response in zip(futures, responses):
-                    if isinstance(response, Exception):
-                        future.set_exception(response)
-                    else:
-                        future.set_result(response)
+                    if not future.done():
+                        if isinstance(response, Exception):
+                            future.set_exception(response)
+                        else:
+                            future.set_result(response)
             except Exception as e:
                 # If batch fails, fail all futures
                 logger.exception(e)

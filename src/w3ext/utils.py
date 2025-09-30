@@ -125,29 +125,28 @@ async def is_eip1559(w3: 'AsyncWeb3'):
 
 async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
     """
-    Fill gas price in transaction if not already set.
+    Fill gas price in a transaction if not already set.
 
-    Automatically sets gasPrice for legacy transactions on non-EIP1559 networks.
-    For EIP-1559 networks, leaves gas pricing to be handled by maxFeePerGas
-    and maxPriorityFeePerGas parameters.
+    For EIP-1559 networks, it sets 'maxFeePerGas' and 'maxPriorityFeePerGas' if they
+    are not provided. For legacy networks, it sets 'gasPrice'.
 
     Args:
-        w3: AsyncWeb3 or Chain instance
-        transaction: Transaction parameters to fill
+        w3: An AsyncWeb3 or Chain instance.
+        transaction: The transaction dictionary.
 
     Returns:
-        Transaction with gas price filled if needed
-
-    Example:
-        >>> tx = {'to': '0x123...', 'value': 1000}
-        >>> tx = await fill_gas_price(w3, tx)
-        >>> # tx now has 'gasPrice' set if on legacy network
+        The transaction dictionary with gas price parameters filled.
     """
-    if 'gasPrice' not in transaction:
-        _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559')
-                            else is_eip1559(w3))
-        if not _eip1559:
-            transaction['gasPrice'] = await w3.eth.gas_price
+    _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559') else is_eip1559(w3))
+    if _eip1559:
+        if 'maxFeePerGas' not in transaction or 'maxPriorityFeePerGas' not in transaction:
+            base_fee = (await w3.eth.get_block('latest'))['baseFeePerGas']
+            priority_fee = await w3.eth.max_priority_fee
+            transaction['maxPriorityFeePerGas'] = priority_fee
+            transaction['maxFeePerGas'] = int(base_fee * 1.2) + priority_fee
+    elif 'gasPrice' not in transaction:
+        transaction['gasPrice'] = await w3.eth.gas_price
+
     return transaction
 
 

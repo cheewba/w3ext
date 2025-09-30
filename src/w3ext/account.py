@@ -41,7 +41,7 @@ except ImportError:
 
 
 from .utils import construct_async_sign_and_send_raw_middleware
-from .chain import Token
+from .token import Token
 if TYPE_CHECKING:
     from .chain import Chain
     from .token import CurrencyAmount
