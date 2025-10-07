@@ -45,9 +45,9 @@ from web3.middleware import Web3Middleware
 from web3.middleware.signing import format_transaction, gen_normalized_accounts
 from web3.types import RPCEndpoint, RPCResponse, TxParams
 try:
-    from web3._utils.async_transactions import async_fill_transaction_defaults
+    from web3._utils.async_transactions import async_fill_transaction_defaults as fill_transaction_defaults
 except ImportError:
-    from web3._utils.async_transactions import fill_transaction_defaults as async_fill_transaction_defaults
+    from web3._utils.async_transactions import fill_transaction_defaults as fill_transaction_defaults
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -233,16 +233,28 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
         >>> # Now eth_sendTransaction calls will be auto-signed
     """
 
-    def __init__(self, w3: AsyncWeb3, accounts: Dict[ChecksumAddress, LocalAccount]) -> None:
+    def __init__(
+        self,
+        w3: AsyncWeb3,
+        accounts: Union[Dict[ChecksumAddress, LocalAccount], Callable[[], Dict[ChecksumAddress, LocalAccount]]],
+    ) -> None:
         """
         Initialize the signing middleware.
 
         Args:
             w3: AsyncWeb3 instance
-            accounts: Dictionary mapping addresses to LocalAccount instances
+            accounts: Either:
+                      - a dict mapping addresses to LocalAccount instances, or
+                      - a callable returning such dict (evaluated per request)
         """
         super().__init__(w3)
-        self._accounts = accounts
+        self._accounts: Dict[ChecksumAddress, LocalAccount] = {}
+        self._accounts_fn: Optional[Callable[[], Dict[ChecksumAddress, LocalAccount]]] = None
+        if callable(accounts):
+            # when callable passed, we will call it on each request to fetch active accounts
+            self._accounts_fn = accounts
+        else:
+            self._accounts = accounts
 
     async def async_wrap_make_request(self, make_request):
         """
@@ -264,18 +276,20 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
             transaction = params[0]
             transaction = await fill_chain_id(self._w3, transaction)
             transaction = await fill_nonce(self._w3, transaction)
-            transaction = await async_fill_transaction_defaults(self._w3, transaction)
+            transaction = await fill_transaction_defaults(self._w3, transaction)
             transaction = await fill_gas_price(self._w3, transaction)
             transaction = format_transaction(transaction)
 
             if 'from' not in transaction:
                 return await make_request(method, params)
 
-            if transaction.get('from') not in self._accounts:
+            accounts = self._accounts_fn() if getattr(self, "_accounts_fn", None) else self._accounts
+            sender = transaction.get('from')
+            if sender not in accounts:
                 return await make_request(method, params)
 
             # pylint: disable=unsubscriptable-object
-            account = self._accounts[transaction['from']]
+            account = accounts[sender]
             raw_tx = account.sign_transaction(transaction).raw_transaction
 
             return await make_request(RPCEndpoint('eth_sendRawTransaction'),

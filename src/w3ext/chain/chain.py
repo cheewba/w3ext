@@ -9,12 +9,13 @@ features like batch operations, automatic token/NFT loading, and simplified acco
 
 import asyncio
 import os
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from typing import Optional, Any, Union, cast, Type, Dict
 
 from eth_typing import HexAddress, ChecksumAddress
+from eth_account.signers.local import LocalAccount
 from web3 import AsyncWeb3 as _AsyncWeb3, AsyncHTTPProvider
 from web3.eth import AsyncEth
 from web3.providers import AsyncBaseProvider
@@ -25,20 +26,21 @@ from web3.middleware import (
     ValidationMiddleware,
     ExtraDataToPOAMiddleware
 )
-from web3.types import HexBytes, TxParams, HexStr, TxReceipt
+from web3.types import HexBytes, TxParams, HexStr, TxReceipt, StateOverride, BlockIdentifier
 
 from .chainlist import get_chain_provider
 from ..contract import Contract
 from ..exceptions import ChainException
 from ..token import Currency, Token, CurrencyAmount
 from ..nft import Nft721Collection
-from ..utils import is_eip1559, load_abi, to_checksum_address
+from ..utils import is_eip1559, load_abi, to_checksum_address, AsyncSignSendRawMiddleware
 from ..batch import Batch, is_batch_method, to_batch_aware_method
 from ..account import Account
 
 
 ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'abi')
-_batcher_var = ContextVar("_batcher_var", default=None)
+_batcher_ctx_var = ContextVar("_batcher_ctx_var", default={})
+_accounts_ctx_var = ContextVar("_accounts_ctx_var", default={})
 
 
 async def a_dummy(value):
@@ -91,7 +93,7 @@ def patch_provider(provider_instance, chain):
     class PatchedProvider(orig_cls):
         @property
         def _is_batching(self):
-            # Custom getter: return whether _batcher_var indicates batching is active.
+            # Custom getter: return whether _batcher_ctx_var indicates batching is active.
             return chain._is_batching
 
         @_is_batching.setter
@@ -189,6 +191,13 @@ class Chain:
         # Cache for loaded ABI files to avoid repeated disk reads
         self._abi_cache: Dict[str, Any] = {}
 
+        # install signing middleware that reads active accounts from chain context
+        if not self.__web3.middleware_onion.get('w3ext-signing'):
+            def _w3ext_signing_factory(w3, _self=self):
+                # Middleware pulls accounts from the current async context
+                return AsyncSignSendRawMiddleware(w3, lambda: _self._get_active_accounts())
+            self.__web3.middleware_onion.add(_w3ext_signing_factory, 'w3ext-signing')
+
     @classmethod
     async def connect(
         cls: Type["Chain"],
@@ -238,7 +247,35 @@ class Chain:
 
     @property
     def batcher(self):
-        return _batcher_var.get()
+        store = _batcher_ctx_var.get()
+        return store.get(id(self)) if store else None
+
+    # Returns active signer accounts for this chain from the async context
+    def _get_active_accounts(self) -> Dict[ChecksumAddress, LocalAccount]:
+        store = _accounts_ctx_var.get()
+        return store.get(id(self), {}) if store else {}
+
+    @contextmanager
+    def use_account(self, account: "Account"):
+        """
+        Temporarily add an Account into the active signer set for this chain within the current async context.
+        The signing middleware will pick it up for eth_sendTransaction and sign accordingly.
+        """
+        store = _accounts_ctx_var.get() or {}
+        token = None
+        try:
+            # copy-on-write to avoid mutating parent context
+            new_store = dict(store)
+            per_chain = dict(new_store.get(id(self), {}))
+            # Account holds LocalAccount internally; we use duck typing for sign_transaction
+            local_acc = getattr(account, "_acc", None) or account
+            per_chain[account.address] = local_acc  # type: ignore[assignment]
+            new_store[id(self)] = per_chain
+            token = _accounts_ctx_var.set(new_store)
+            yield self
+        finally:
+            if token is not None:
+                _accounts_ctx_var.reset(token)
 
     @asynccontextmanager
     async def use_batch(self, max_size: int = 20, max_wait: float = 0.1):
@@ -266,11 +303,14 @@ class Chain:
         token = None
         try:
             async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
-                token = _batcher_var.set(batcher)
+                store = _batcher_ctx_var.get() or {}
+                new_store = dict(store)
+                new_store[id(self)] = batcher
+                token = _batcher_ctx_var.set(new_store)
                 yield batcher
         finally:
             if token:
-                _batcher_var.reset(token)
+                _batcher_ctx_var.reset(token)
 
     async def _add_to_batch_request_info(self, request_info):
         return await self.batcher._add_request_info(request_info)
@@ -462,7 +502,7 @@ class Chain:
         """
         if isinstance(address, Account):
             address = address.address
-        if token is not None:
+        if token is not None and isinstance(token, Token):
             return await token.get_balance(address)
 
         address = to_checksum_address(str(address))
@@ -473,6 +513,14 @@ class Chain:
         return await self.eth.get_transaction_count(
             cast(ChecksumAddress, address)
         )
+
+    async def estimate_gas(
+        self,
+        transaction: TxParams,
+        block_identifier: Optional[BlockIdentifier] = None,
+        state_override: Optional[StateOverride] = None,
+    ) -> int:
+        await self._web3.eth.estimate_gas(transaction, block_identifier, state_override)
 
     async def send_transaction(self, tx: TxParams, account: Optional["Account"] = None) -> HexBytes:
         with ExitStack() as stack:
