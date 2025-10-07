@@ -45,9 +45,9 @@ from web3.middleware import Web3Middleware
 from web3.middleware.signing import format_transaction, gen_normalized_accounts
 from web3.types import RPCEndpoint, RPCResponse, TxParams
 try:
-    from web3._utils.async_transactions import async_fill_transaction_defaults
+    from web3._utils.async_transactions import async_fill_transaction_defaults as fill_transaction_defaults
 except ImportError:
-    from web3._utils.async_transactions import fill_transaction_defaults as async_fill_transaction_defaults
+    from web3._utils.async_transactions import fill_transaction_defaults as fill_transaction_defaults
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -125,29 +125,28 @@ async def is_eip1559(w3: 'AsyncWeb3'):
 
 async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
     """
-    Fill gas price in transaction if not already set.
+    Fill gas price in a transaction if not already set.
 
-    Automatically sets gasPrice for legacy transactions on non-EIP1559 networks.
-    For EIP-1559 networks, leaves gas pricing to be handled by maxFeePerGas
-    and maxPriorityFeePerGas parameters.
+    For EIP-1559 networks, it sets 'maxFeePerGas' and 'maxPriorityFeePerGas' if they
+    are not provided. For legacy networks, it sets 'gasPrice'.
 
     Args:
-        w3: AsyncWeb3 or Chain instance
-        transaction: Transaction parameters to fill
+        w3: An AsyncWeb3 or Chain instance.
+        transaction: The transaction dictionary.
 
     Returns:
-        Transaction with gas price filled if needed
-
-    Example:
-        >>> tx = {'to': '0x123...', 'value': 1000}
-        >>> tx = await fill_gas_price(w3, tx)
-        >>> # tx now has 'gasPrice' set if on legacy network
+        The transaction dictionary with gas price parameters filled.
     """
-    if 'gasPrice' not in transaction:
-        _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559')
-                            else is_eip1559(w3))
-        if not _eip1559:
-            transaction['gasPrice'] = await w3.eth.gas_price
+    _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559') else is_eip1559(w3))
+    if _eip1559:
+        if 'maxFeePerGas' not in transaction or 'maxPriorityFeePerGas' not in transaction:
+            base_fee = (await w3.eth.get_block('latest'))['baseFeePerGas']
+            priority_fee = await w3.eth.max_priority_fee
+            transaction['maxPriorityFeePerGas'] = priority_fee
+            transaction['maxFeePerGas'] = int(base_fee * 1.2) + priority_fee
+    elif 'gasPrice' not in transaction:
+        transaction['gasPrice'] = await w3.eth.gas_price
+
     return transaction
 
 
@@ -234,16 +233,28 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
         >>> # Now eth_sendTransaction calls will be auto-signed
     """
 
-    def __init__(self, w3: AsyncWeb3, accounts: Dict[ChecksumAddress, LocalAccount]) -> None:
+    def __init__(
+        self,
+        w3: AsyncWeb3,
+        accounts: Union[Dict[ChecksumAddress, LocalAccount], Callable[[], Dict[ChecksumAddress, LocalAccount]]],
+    ) -> None:
         """
         Initialize the signing middleware.
 
         Args:
             w3: AsyncWeb3 instance
-            accounts: Dictionary mapping addresses to LocalAccount instances
+            accounts: Either:
+                      - a dict mapping addresses to LocalAccount instances, or
+                      - a callable returning such dict (evaluated per request)
         """
         super().__init__(w3)
-        self._accounts = accounts
+        self._accounts: Dict[ChecksumAddress, LocalAccount] = {}
+        self._accounts_fn: Optional[Callable[[], Dict[ChecksumAddress, LocalAccount]]] = None
+        if callable(accounts):
+            # when callable passed, we will call it on each request to fetch active accounts
+            self._accounts_fn = accounts
+        else:
+            self._accounts = accounts
 
     async def async_wrap_make_request(self, make_request):
         """
@@ -265,18 +276,20 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
             transaction = params[0]
             transaction = await fill_chain_id(self._w3, transaction)
             transaction = await fill_nonce(self._w3, transaction)
-            transaction = await async_fill_transaction_defaults(self._w3, transaction)
+            transaction = await fill_transaction_defaults(self._w3, transaction)
             transaction = await fill_gas_price(self._w3, transaction)
             transaction = format_transaction(transaction)
 
             if 'from' not in transaction:
                 return await make_request(method, params)
 
-            if transaction.get('from') not in self._accounts:
+            accounts = self._accounts_fn() if getattr(self, "_accounts_fn", None) else self._accounts
+            sender = transaction.get('from')
+            if sender not in accounts:
                 return await make_request(method, params)
 
             # pylint: disable=unsubscriptable-object
-            account = self._accounts[transaction['from']]
+            account = accounts[sender]
             raw_tx = account.sign_transaction(transaction).raw_transaction
 
             return await make_request(RPCEndpoint('eth_sendRawTransaction'),

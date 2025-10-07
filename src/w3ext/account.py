@@ -24,7 +24,7 @@ Example:
 
 # pylint: disable=no-name-in-module
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from typing import TypeVar, Any, TYPE_CHECKING, Union, List, Iterator, Optional, NamedTuple, Mapping
 
 from eth_account.signers.local import LocalAccount
@@ -40,8 +40,7 @@ except ImportError:
         return encode_structured_data(full_message)
 
 
-from .utils import construct_async_sign_and_send_raw_middleware
-from .chain import Token
+from .token import Token
 if TYPE_CHECKING:
     from .chain import Chain
     from .token import CurrencyAmount
@@ -138,39 +137,14 @@ class Account:
         """
         Context manager to temporarily add account signing to chains.
 
-        Within the context, all provided chains will automatically sign transactions
-        sent from this account's address without requiring explicit account access.
-        The signing middleware is automatically removed when exiting the context.
-
-        Args:
-            *chains: One or more Chain instances to add signing to
-
-        Yields:
-            ChainAccount instance (single chain) or list of ChainAccount instances (multiple chains)
-
-        Example:
-            >>> account = Account.from_key("0x1234...")
-            >>> with account.onchain(ethereum_chain, polygon_chain) as chain_accounts:
-            ...     eth_account, poly_account = chain_accounts
-            ...     # Transactions can now be sent without explicit signing
-            ...     await eth_account.get_balance()
-            ...     await poly_account.get_balance()
-            >>> # Signing middleware automatically removed here
+        Adds this account to each chain's async-context account set using Chain.use_account.
+        The chain's signing middleware reads the active accounts at request time.
         """
-        chains_processed = []
-        try:
+        with ExitStack() as stack:
             for chain in chains:
-                if not chain.middleware_onion.get(self.address):
-                    chain.middleware_onion.add(
-                        construct_async_sign_and_send_raw_middleware(self._acc),
-                        self.address,
-                    )
-                    chains_processed.append(chain)
+                stack.enter_context(chain.use_account(self))
             bound = [self.use_chain(chain) for chain in chains]
             yield bound[0] if len(bound) == 1 else bound
-        finally:
-            for chain in chains_processed:
-                chain.middleware_onion.remove(self.address)
 
     async def sign(self, data: Union[bytes, str, Mapping], hex_only=True) -> Union[SignedMessage, HexBytes]:
         """
@@ -220,7 +194,7 @@ class Account:
                 pass
 
         if is_eip712:
-            encoded = encode_typed_data(data)
+            encoded = encode_typed_data(full_message=data)
         elif (isinstance(data, bytes)):
             encoded = encode_defunct(bytes=data)
         elif data.startswith('0x'):

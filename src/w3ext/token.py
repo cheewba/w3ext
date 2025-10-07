@@ -6,7 +6,7 @@ This module provides classes for handling currencies, tokens, and their amounts
 with proper decimal handling and arithmetic operations. It includes support for
 both native currencies (like ETH) and ERC20 tokens.
 """
-
+from decimal import Decimal
 from numbers import Number
 from typing import Optional, Any, Union, TYPE_CHECKING, Self, cast
 
@@ -542,7 +542,7 @@ class CurrencyAmount:
             >>> amount = eth(1.5)
             >>> print(str(amount))  # "1.500 ETH"
         """
-        return f"{self.to_fixed()} {self.currency}"
+        return f"{self.to_sigfrac()} {self.currency}"
 
     def __repr__(self) -> str:
         """
@@ -570,6 +570,34 @@ class CurrencyAmount:
             >>> print(amount.to_fixed(6))  # 1.234568
         """
         return round(self.amount / 10 ** self.currency.decimals, decimals)
+
+    def to_sigfrac(self, digits: int = 3) -> str:
+        """
+        Integer part unchanged.
+        Fractional part: keep all leading zeros, then up to `digits` digits
+        starting at the first non-zero fractional digit.
+        If fractional part is all zeros → no decimal part shown.
+        """
+        # avoids float artifacts, handles big/small numbers
+        d = Decimal(str(self.amount / 10 ** self.currency.decimals))
+        sign = '-' if d.is_signed() else ''
+        d = abs(d)
+
+        s = format(d, 'f')  # no exponent, plain decimal string
+        if '.' not in s:
+            return sign + s
+
+        int_part, frac_part = s.split('.', 1)
+
+        # all zeros after decimal → return integer only
+        if frac_part.strip('0') == '':
+            return sign + int_part
+
+        # keep all leading zeros before the first non-zero
+        i = next(idx for idx, ch in enumerate(frac_part) if ch != '0')
+        keep_zeros = frac_part[:i]
+        rest = frac_part[i:i+digits]  # up to N digits after the first non-zero
+        return sign + int_part + '.' + keep_zeros + rest
 
 
 class TokenAmount(CurrencyAmount):
