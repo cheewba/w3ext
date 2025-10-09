@@ -520,7 +520,7 @@ class Chain:
         block_identifier: Optional[BlockIdentifier] = None,
         state_override: Optional[StateOverride] = None,
     ) -> int:
-        await self._web3.eth.estimate_gas(transaction, block_identifier, state_override)
+        return await self._web3.eth.estimate_gas(transaction, block_identifier, state_override)
 
     async def send_transaction(self, tx: TxParams, account: Optional["Account"] = None) -> HexBytes:
         with ExitStack() as stack:

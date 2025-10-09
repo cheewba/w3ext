@@ -372,6 +372,8 @@ def keccak256(value: Union[str, bytes]) -> str:
     return hex
 
 
+solidity_keccak = Web3.solidity_keccak
+
 class AttrDict(dict):
     """
     Dictionary with attribute-style access.
