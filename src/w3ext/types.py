@@ -9,4 +9,4 @@ Example:
     >>> tx: TxParams = {'to': '0x123...', 'value': 1000}
 """
 
-from web3.types import TxParams  # noqa: F401
+from web3.types import TxParams, StateOverride, StateOverrideParams  # noqa: F401
