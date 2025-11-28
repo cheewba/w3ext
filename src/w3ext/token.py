@@ -409,6 +409,36 @@ class CurrencyAmount:
         return self._new_amount(int(self.amount / self._to_amount(other).amount / 10 ** other.currency.decimals))
     __rtruediv__ = __truediv__
 
+    def __neg__(self: Self) -> Self:
+        """
+        Return the negative of this amount.
+
+        Returns:
+            New CurrencyAmount with negated amount
+
+        Example:
+            >>> eth = Currency("Ethereum", "ETH", 18)
+            >>> amount = eth(1.5)      # 1.5 ETH
+            >>> negative = -amount     # -1.5 ETH
+            >>> print(negative.to_fixed(1))  # "-1.5"
+        """
+        return self._new_amount(-self.amount)
+
+    def __abs__(self: Self) -> Self:
+        """
+        Return the absolute value of this amount.
+
+        Returns:
+            New CurrencyAmount with absolute value
+
+        Example:
+            >>> eth = Currency("Ethereum", "ETH", 18)
+            >>> amount = eth(-1.5)     # -1.5 ETH
+            >>> absolute = abs(amount) # 1.5 ETH
+            >>> print(absolute.to_fixed(1))  # "1.5"
+        """
+        return self._new_amount(abs(self.amount))
+
     def __gt__(self: Self, other: Self) -> bool:
         """
         Check if this amount is greater than another.
