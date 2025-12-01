@@ -33,7 +33,9 @@ from ..contract import Contract
 from ..exceptions import ChainException
 from ..token import Currency, Token, CurrencyAmount
 from ..nft import Nft721Collection
-from ..utils import is_eip1559, load_abi, to_checksum_address, AsyncSignSendRawMiddleware
+from ..utils import (
+    is_eip1559, load_abi, to_checksum_address, AsyncSignSendRawMiddleware, get_gas_price,
+)
 from ..batch import Batch, is_batch_method, to_batch_aware_method
 from ..account import Account
 
@@ -513,6 +515,23 @@ class Chain:
         return await self.eth.get_transaction_count(
             cast(ChecksumAddress, address)
         )
+
+    async def get_gas_price(self) -> CurrencyAmount:
+        """
+        Get the current gas price as CurrencyAmount.
+
+        For EIP-1559 networks, calculates the effective gas price by summing
+        the base fee and priority fee. For legacy networks, returns the
+        current gas price directly.
+
+        Returns:
+            CurrencyAmount representing the gas price
+
+        Example:
+            >>> gas_price = await chain.get_gas_price()
+            >>> print(f"Gas price: {gas_price.to_fixed(2)} ETH")
+        """
+        return self.currency.to_amount(await get_gas_price(self))
 
     async def estimate_gas(
         self,

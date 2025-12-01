@@ -123,6 +123,35 @@ async def is_eip1559(w3: 'AsyncWeb3'):
     return fee['baseFeePerGas'][0] != 0
 
 
+async def get_gas_price(w3: 'Chain') -> int:
+    """
+    Get the current gas price for transactions.
+
+    For EIP-1559 networks, calculates the effective gas price by summing the
+    base fee and priority fee. For legacy networks, returns the current gas
+    price directly.
+
+    Args:
+        w3: Chain or AsyncWeb3 instance
+
+    Returns:
+        Gas price in wei
+
+    Example:
+        >>> gas_price = await get_gas_price(chain)
+        >>> print(f"Gas price: {gas_price} wei")
+    """
+    _eip1559 = await (
+        w3.is_eip1559() if hasattr(w3, 'is_eip1559') else is_eip1559(w3)
+    )
+    if _eip1559:
+        base_fee = (await w3.eth.get_block('latest'))['baseFeePerGas']
+        priority_fee = await w3.eth.max_priority_fee
+        return base_fee + priority_fee
+    else:
+        return await w3.eth.gas_price
+
+
 async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
     """
     Fill gas price in a transaction if not already set.

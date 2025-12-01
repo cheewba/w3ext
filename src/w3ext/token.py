@@ -12,13 +12,42 @@ from typing import Optional, Any, Union, TYPE_CHECKING, Self, cast
 
 from eth_typing import HexAddress
 from web3.types import TxParams, HexBytes
-
 from .utils import to_checksum_address
 if TYPE_CHECKING:
     from .account import Account
     from .contract import Contract
 
 __all__ = ['Currency', 'Token', 'CurrencyAmount', 'TokenAmount']
+
+
+UNIT_MULTIPLIERS = {
+    'wei': 1,
+    'kwei': 10 ** 3,
+    'babbage': 10 ** 3,
+    'mwei': 10 ** 6,
+    'lovelace': 10 ** 6,
+    'gwei': 10 ** 9,
+    'shannon': 10 ** 9,
+    'microether': 10 ** 12,
+    'szabo': 10 ** 12,
+    'milliether': 10 ** 15,
+    'finney': 10 ** 15,
+    'ether': 10 ** 18,
+    'kether': 10 ** 21,
+    'grand': 10 ** 21,
+    'mether': 10 ** 24,
+    'gether': 10 ** 27,
+    'tether': 10 ** 30,
+}
+
+
+def _convert_to_wei(amount: float, unit: str) -> int:
+    """Convert amount in given unit to wei."""
+    if unit in UNIT_MULTIPLIERS:
+        return int(amount * UNIT_MULTIPLIERS[unit])
+
+    valid_units = ', '.join(UNIT_MULTIPLIERS.keys())
+    raise ValueError(f"Unknown unit '{unit}'. Valid units: {valid_units}")
 
 
 class Currency:
@@ -65,26 +94,35 @@ class Currency:
         """
         return CurrencyAmount(self, amount)
 
-    def parse_amount(self, amount: float) -> 'CurrencyAmount':
+    def parse_amount(
+        self,
+        amount: float,
+        unit: str = 'ether'
+    ) -> 'CurrencyAmount':
         """
         Convert human-readable amount to CurrencyAmount.
 
         Args:
             amount: Human-readable amount (e.g., 1.5 for 1.5 ETH)
+            unit: Unit of the amount ('wei', 'gwei', 'ether', 'kether',
+                  etc.). Default: 'ether'
 
         Returns:
             CurrencyAmount with proper decimal conversion
 
         Note:
-            You can also use the shorthand: currency(amount) which calls this method.
+            You can also use the shorthand: currency(amount, unit) which
+            calls this method.
 
         Example:
             >>> eth = Currency("Ethereum", "ETH", 18)
-            >>> amount1 = eth.parse_amount(1.5)  # Explicit call
-            >>> amount2 = eth(1.5)               # Shorthand (same result)
+            >>> amount1 = eth.parse_amount(1.5)  # 1.5 ether (default)
+            >>> amount2 = eth.parse_amount(1500000000, 'gwei')
+            >>> amount3 = eth(1.5, 'ether')  # Shorthand with unit
             >>> print(amount1.amount)  # 1500000000000000000 (wei)
         """
-        return CurrencyAmount(self, amount * 10 ** self.decimals)
+        raw_amount = _convert_to_wei(amount, unit)
+        return CurrencyAmount(self, raw_amount)
     __call__ = parse_amount
 
     def __str__(self) -> str:
@@ -162,25 +200,34 @@ class Token(Currency):
         """
         return TokenAmount(self, amount)
 
-    def parse_amount(self, amount: float) -> 'TokenAmount':
+    def parse_amount(
+        self,
+        amount: float,
+        unit: str = 'ether'
+    ) -> 'TokenAmount':
         """
         Convert human-readable amount to TokenAmount.
 
         Args:
             amount: Human-readable amount (e.g., 100.5 for 100.5 USDC)
+            unit: Unit of the amount ('wei', 'gwei', 'ether', 'kether',
+                  etc.). Default: 'ether'
 
         Returns:
             TokenAmount with proper decimal conversion
 
         Note:
-            You can also use the shorthand: token(amount) which calls this method.
+            You can also use the shorthand: token(amount, unit) which
+            calls this method.
 
         Example:
             >>> usdc = await chain.load_token("0x...")
-            >>> amount1 = usdc.parse_amount(100.5)  # Explicit call
-            >>> amount2 = usdc(100.5)               # Shorthand (same result)
+            >>> amount1 = usdc.parse_amount(100.5)  # 100.5 ether (default)
+            >>> amount2 = usdc.parse_amount(100500000, 'gwei')
+            >>> amount3 = usdc(100.5, 'ether')  # Shorthand with unit
         """
-        return TokenAmount(self, amount * 10 ** self.decimals)
+        raw_amount = _convert_to_wei(amount, unit)
+        return TokenAmount(self, raw_amount)
     __call__ = parse_amount
 
     async def get_balance(self, address: Union[HexAddress, "Account"]) -> "TokenAmount":
