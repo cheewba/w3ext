@@ -41,13 +41,20 @@ UNIT_MULTIPLIERS = {
 }
 
 
-def _convert_to_wei(amount: float, unit: str) -> int:
+def _from_unit(amount: float, unit: str) -> int:
     """Convert amount in given unit to wei."""
-    if unit in UNIT_MULTIPLIERS:
-        return int(amount * UNIT_MULTIPLIERS[unit])
+    if unit not in UNIT_MULTIPLIERS:
+        valid_units = ', '.join(UNIT_MULTIPLIERS.keys())
+        raise ValueError(f"Unknown unit '{unit}'. Valid units: {valid_units}")
+    return int(amount * UNIT_MULTIPLIERS[unit])
 
-    valid_units = ', '.join(UNIT_MULTIPLIERS.keys())
-    raise ValueError(f"Unknown unit '{unit}'. Valid units: {valid_units}")
+
+def _to_unit(amount: int, unit: str) -> float:
+    """Convert amount in wei to given unit."""
+    if unit not in UNIT_MULTIPLIERS:
+        valid_units = ', '.join(UNIT_MULTIPLIERS.keys())
+        raise ValueError(f"Unknown unit '{unit}'. Valid units: {valid_units}")
+    return amount / UNIT_MULTIPLIERS[unit]
 
 
 class Currency:
@@ -121,7 +128,7 @@ class Currency:
             >>> amount3 = eth(1.5, 'ether')  # Shorthand with unit
             >>> print(amount1.amount)  # 1500000000000000000 (wei)
         """
-        raw_amount = _convert_to_wei(amount, unit)
+        raw_amount = _from_unit(amount, unit)
         return CurrencyAmount(self, raw_amount)
     __call__ = parse_amount
 
@@ -226,7 +233,7 @@ class Token(Currency):
             >>> amount2 = usdc.parse_amount(100500000, 'gwei')
             >>> amount3 = usdc(100.5, 'ether')  # Shorthand with unit
         """
-        raw_amount = _convert_to_wei(amount, unit)
+        raw_amount = _from_unit(amount, unit)
         return TokenAmount(self, raw_amount)
     __call__ = parse_amount
 
@@ -630,33 +637,50 @@ class CurrencyAmount:
         """
         return str(self)
 
-    def to_fixed(self, decimals=3):
+    def to_fixed(self, decimals: int = 3, unit: str = 'ether') -> float:
         """
         Convert to human-readable decimal format.
 
         Args:
             decimals: Number of decimal places to show (default: 3)
+            unit: Unit to display the amount in ('wei', 'gwei', 'ether',
+                  etc.). Default: 'ether'
 
         Returns:
-            Rounded decimal value
+            Rounded decimal value in the specified unit
 
         Example:
             >>> eth = Currency("Ethereum", "ETH", 18)
             >>> amount = eth(1.23456789)
-            >>> print(amount.to_fixed(2))  # 1.23
-            >>> print(amount.to_fixed(6))  # 1.234568
+            >>> print(amount.to_fixed(2))  # 1.23 (in ether)
+            >>> print(amount.to_fixed(2, 'gwei'))  # 1234567890.00 (in gwei)
+            >>> print(amount.to_fixed(0, 'wei'))  # 1234567890000000000 (in wei)
         """
-        return round(self.amount / 10 ** self.currency.decimals, decimals)
+        return round(_to_unit(self.amount, unit), decimals)
 
-    def to_sigfrac(self, digits: int = 3) -> str:
+    def to_sigfrac(self, digits: int = 3, unit: str = 'ether') -> str:
         """
         Integer part unchanged.
         Fractional part: keep all leading zeros, then up to `digits` digits
         starting at the first non-zero fractional digit.
         If fractional part is all zeros → no decimal part shown.
+
+        Args:
+            digits: Number of significant fractional digits (default: 3)
+            unit: Unit to display the amount in ('wei', 'gwei', 'ether',
+                  etc.). Default: 'ether'
+
+        Returns:
+            Formatted string with significant fractional digits in the
+            specified unit
+
+        Example:
+            >>> eth = Currency("Ethereum", "ETH", 18)
+            >>> amount = eth(1.000123)
+            >>> print(amount.to_sigfrac())  # "1.000123" (in ether)
+            >>> print(amount.to_sigfrac(3, 'gwei'))  # "1000.123" (in gwei)
         """
-        # avoids float artifacts, handles big/small numbers
-        d = Decimal(str(self.amount / 10 ** self.currency.decimals))
+        d = Decimal(str(_to_unit(self.amount, unit)))
         sign = '-' if d.is_signed() else ''
         d = abs(d)
 
