@@ -50,7 +50,7 @@ except ImportError:
     from web3._utils.async_transactions import fill_transaction_defaults as fill_transaction_defaults
 
 if TYPE_CHECKING:
-    from .chain import Chain
+    from ..chain import Chain
 
 
 _PrivateKey = Union[LocalAccount, PrivateKey, HexStr, bytes]
