@@ -104,18 +104,22 @@ class Currency:
     def parse_amount(
         self,
         amount: float,
-        unit: str = 'ether'
+        unit: Optional[str] = None
     ) -> 'CurrencyAmount':
         """
         Convert human-readable amount to CurrencyAmount.
 
         Args:
             amount: Human-readable amount (e.g., 1.5 for 1.5 ETH)
-            unit: Unit of the amount ('wei', 'gwei', 'ether', 'kether',
-                  etc.). Default: 'ether'
+            unit: Unit of the amount ('wei', 'gwei', 'ether', etc.).
+                  If None (default), uses currency's decimals.
+                  If specified, currency must have 18 decimals.
 
         Returns:
             CurrencyAmount with proper decimal conversion
+
+        Raises:
+            ValueError: If unit is specified but currency decimals != 18
 
         Note:
             You can also use the shorthand: currency(amount, unit) which
@@ -123,12 +127,20 @@ class Currency:
 
         Example:
             >>> eth = Currency("Ethereum", "ETH", 18)
-            >>> amount1 = eth.parse_amount(1.5)  # 1.5 ether (default)
-            >>> amount2 = eth.parse_amount(1500000000, 'gwei')
-            >>> amount3 = eth(1.5, 'ether')  # Shorthand with unit
-            >>> print(amount1.amount)  # 1500000000000000000 (wei)
+            >>> amount1 = eth.parse_amount(1.5)  # Uses currency decimals
+            >>> amount2 = eth.parse_amount(1500000000, 'gwei')  # Explicit unit
+            >>> usdc = Currency("USD Coin", "USDC", 6)
+            >>> amount3 = usdc.parse_amount(100.5)  # Uses 6 decimals
         """
-        raw_amount = _from_unit(amount, unit)
+        if unit is None:
+            raw_amount = int(amount * 10 ** self.decimals)
+        else:
+            if self.decimals != 18:
+                raise ValueError(
+                    f"Unit conversion only supported for 18-decimal currencies. "
+                    f"{self.symbol} has {self.decimals} decimals"
+                )
+            raw_amount = _from_unit(amount, unit)
         return CurrencyAmount(self, raw_amount)
     __call__ = parse_amount
 
@@ -210,30 +222,43 @@ class Token(Currency):
     def parse_amount(
         self,
         amount: float,
-        unit: str = 'ether'
+        unit: Optional[str] = None
     ) -> 'TokenAmount':
         """
         Convert human-readable amount to TokenAmount.
 
         Args:
             amount: Human-readable amount (e.g., 100.5 for 100.5 USDC)
-            unit: Unit of the amount ('wei', 'gwei', 'ether', 'kether',
-                  etc.). Default: 'ether'
+            unit: Unit of the amount ('wei', 'gwei', 'ether', etc.).
+                  If None (default), uses token's decimals.
+                  If specified, token must have 18 decimals.
 
         Returns:
             TokenAmount with proper decimal conversion
+
+        Raises:
+            ValueError: If unit is specified but token decimals != 18
 
         Note:
             You can also use the shorthand: token(amount, unit) which
             calls this method.
 
         Example:
-            >>> usdc = await chain.load_token("0x...")
-            >>> amount1 = usdc.parse_amount(100.5)  # 100.5 ether (default)
-            >>> amount2 = usdc.parse_amount(100500000, 'gwei')
-            >>> amount3 = usdc(100.5, 'ether')  # Shorthand with unit
+            >>> weth = await chain.load_token("0x...")  # 18 decimals
+            >>> amount1 = weth.parse_amount(1.5)  # Uses token decimals
+            >>> amount2 = weth.parse_amount(1500000000, 'gwei')  # Explicit unit
+            >>> usdc = await chain.load_token("0x...")  # 6 decimals
+            >>> amount3 = usdc.parse_amount(100.5)  # Uses 6 decimals
         """
-        raw_amount = _from_unit(amount, unit)
+        if unit is None:
+            raw_amount = int(amount * 10 ** self.decimals)
+        else:
+            if self.decimals != 18:
+                raise ValueError(
+                    f"Unit conversion only supported for 18-decimal tokens. "
+                    f"{self.symbol} has {self.decimals} decimals"
+                )
+            raw_amount = _from_unit(amount, unit)
         return TokenAmount(self, raw_amount)
     __call__ = parse_amount
 
@@ -637,28 +662,51 @@ class CurrencyAmount:
         """
         return str(self)
 
-    def to_fixed(self, decimals: int = 3, unit: str = 'ether') -> float:
+    def to_fixed(
+        self,
+        decimals: int = 3,
+        unit: Optional[str] = None
+    ) -> float:
         """
         Convert to human-readable decimal format.
 
         Args:
             decimals: Number of decimal places to show (default: 3)
             unit: Unit to display the amount in ('wei', 'gwei', 'ether',
-                  etc.). Default: 'ether'
+                  etc.). If None (default), uses currency's decimals.
+                  If specified, currency must have 18 decimals.
 
         Returns:
             Rounded decimal value in the specified unit
 
+        Raises:
+            ValueError: If unit is specified but currency decimals != 18
+
         Example:
             >>> eth = Currency("Ethereum", "ETH", 18)
             >>> amount = eth(1.23456789)
-            >>> print(amount.to_fixed(2))  # 1.23 (in ether)
+            >>> print(amount.to_fixed(2))  # 1.23 (using currency decimals)
             >>> print(amount.to_fixed(2, 'gwei'))  # 1234567890.00 (in gwei)
-            >>> print(amount.to_fixed(0, 'wei'))  # 1234567890000000000 (in wei)
+            >>> usdc = Currency("USD Coin", "USDC", 6)
+            >>> usdc_amount = usdc(100.5)
+            >>> print(usdc_amount.to_fixed(2))  # 100.50 (using 6 decimals)
         """
-        return round(_to_unit(self.amount, unit), decimals)
+        if unit is None:
+            value = self.amount / 10 ** self.currency.decimals
+        else:
+            if self.currency.decimals != 18:
+                raise ValueError(
+                    f"Unit conversion only supported for 18-decimal currencies. "
+                    f"{self.currency.symbol} has {self.currency.decimals} decimals"
+                )
+            value = _to_unit(self.amount, unit)
+        return round(value, decimals)
 
-    def to_sigfrac(self, digits: int = 3, unit: str = 'ether') -> str:
+    def to_sigfrac(
+        self,
+        digits: int = 3,
+        unit: Optional[str] = None
+    ) -> str:
         """
         Integer part unchanged.
         Fractional part: keep all leading zeros, then up to `digits` digits
@@ -668,19 +716,35 @@ class CurrencyAmount:
         Args:
             digits: Number of significant fractional digits (default: 3)
             unit: Unit to display the amount in ('wei', 'gwei', 'ether',
-                  etc.). Default: 'ether'
+                  etc.). If None (default), uses currency's decimals.
+                  If specified, currency must have 18 decimals.
 
         Returns:
             Formatted string with significant fractional digits in the
             specified unit
 
+        Raises:
+            ValueError: If unit is specified but currency decimals != 18
+
         Example:
             >>> eth = Currency("Ethereum", "ETH", 18)
             >>> amount = eth(1.000123)
-            >>> print(amount.to_sigfrac())  # "1.000123" (in ether)
+            >>> print(amount.to_sigfrac())  # "1.000123" (using currency decimals)
             >>> print(amount.to_sigfrac(3, 'gwei'))  # "1000.123" (in gwei)
+            >>> usdc = Currency("USD Coin", "USDC", 6)
+            >>> usdc_amount = usdc(100.000123)
+            >>> print(usdc_amount.to_sigfrac())  # "100.000123" (using 6 decimals)
         """
-        d = Decimal(str(_to_unit(self.amount, unit)))
+        if unit is None:
+            value = self.amount / 10 ** self.currency.decimals
+        else:
+            if self.currency.decimals != 18:
+                raise ValueError(
+                    f"Unit conversion only supported for 18-decimal currencies. "
+                    f"{self.currency.symbol} has {self.currency.decimals} decimals"
+                )
+            value = _to_unit(self.amount, unit)
+        d = Decimal(str(value))
         sign = '-' if d.is_signed() else ''
         d = abs(d)
 
