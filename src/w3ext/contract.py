@@ -132,22 +132,40 @@ class NotBoundContractFunction:
         Generate ABI entry from function signature.
 
         Creates a valid ABI function definition from input/output types.
-        Handles both full signatures (inputs, outputs) and input-only signatures.
+        Handles various signature formats including empty inputs/outputs.
 
         Args:
-            signature: Function signature as (inputs, outputs) or just inputs
+            signature: Function signature in one of these formats:
+                - [] : no inputs, no outputs (e.g., deposit())
+                - [[]] : explicitly empty inputs, no outputs
+                - [[], 'type'] : no inputs, with output
+                - ['type1', 'type2'] : inputs only, no outputs
+                - [['type1'], 'type'] : inputs and outputs
 
         Returns:
             ABI function definition dict
 
         Example:
-            >>> # Full signature
+            >>> # No inputs, no outputs
+            >>> abi = self._get_abi([])
+            >>> # Full signature with inputs and outputs
             >>> abi = self._get_abi([['uint256', 'address'], 'bool'])
             >>> # Input-only signature
             >>> abi = self._get_abi(['uint256', 'address'])
         """
-        sig_input = signature if (no_output := isinstance(signature[0], str)) else signature[0]
-        sig_output = signature[1] if not no_output else []
+        # Handle empty signature (no inputs, no outputs)
+        if not signature or (len(signature) == 1 and not signature[0]):
+            sig_input = []
+            sig_output = []
+        # Check if first element is a string (input-only format)
+        elif isinstance(signature[0], str):
+            sig_input = signature
+            sig_output = []
+        # First element is a list (full format with inputs and optional outputs)
+        else:
+            sig_input = signature[0]
+            sig_output = signature[1] if len(signature) > 1 else []
+
         inputs = [{"name": f"arg{i}", "type": item}
                   for i, item in enumerate(sig_input)]
 
