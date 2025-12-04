@@ -340,6 +340,10 @@ class Chain:
         self.__web3.provider = provider
         await self._verify_chain_id(self.chain_id)
 
+    async def close(self):
+        if await self.__web3.is_connected():
+            await self.__web3.provider.disconnect()
+
     @property
     def _web3(self) -> AsyncWeb3:
         return self.__web3
