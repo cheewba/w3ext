@@ -24,11 +24,12 @@ from web3.middleware import (
     BufferedGasEstimateMiddleware,
     GasPriceStrategyMiddleware,
     ValidationMiddleware,
-    ExtraDataToPOAMiddleware
+    ExtraDataToPOAMiddleware,
 )
 from web3.types import HexBytes, TxParams, HexStr, TxReceipt, StateOverride, BlockIdentifier
 
 from .chainlist import get_chain_provider
+from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
 from ..contract import Contract
 from ..exceptions import ChainException
 from ..token import Currency, Token, CurrencyAmount
@@ -200,6 +201,13 @@ class Chain:
                 return AsyncSignSendRawMiddleware(w3, lambda: _self._get_active_accounts())
             self.__web3.middleware_onion.add(_w3ext_signing_factory, 'w3ext-signing')
 
+        # install dynamic middleware proxy for context-specific middlewares
+        if not self.__web3.middleware_onion.get('w3ext-dynamic-context'):
+            def _dynamic_middleware_factory(w3):
+                return DynamicContextMiddleware(w3, self)
+
+            self.__web3.middleware_onion.add(_dynamic_middleware_factory, 'w3ext-dynamic-context')
+
     @classmethod
     async def connect(
         cls: Type["Chain"],
@@ -313,6 +321,36 @@ class Chain:
         finally:
             if token:
                 _batcher_ctx_var.reset(token)
+
+    @asynccontextmanager
+    async def use_middlewares(self, *middlewares: list):
+        """
+        Context manager for applying middlewares within the current async context.
+
+        Args:
+            middlewares: List of middleware factories. Each factory should match
+                         the signature (make_request, w3) -> handler.
+
+        Yields:
+            Chain: The chain instance
+        """
+        store = _middlewares_ctx_var.get() or {}
+        token = None
+        try:
+            # Copy to avoid side effects
+            new_store = dict(store)
+
+            # Get existing middlewares for this chain (from parent context)
+            current_chain_middlewares = list(new_store.get(id(self), []))
+            # Extend with new middlewares
+            current_chain_middlewares.extend(middlewares)
+
+            new_store[id(self)] = current_chain_middlewares
+            token = _middlewares_ctx_var.set(new_store)
+            yield self
+        finally:
+            if token:
+                _middlewares_ctx_var.reset(token)
 
     async def _add_to_batch_request_info(self, request_info):
         return await self.batcher._add_request_info(request_info)
