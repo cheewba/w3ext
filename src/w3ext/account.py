@@ -189,13 +189,13 @@ class Account:
                        ['types', 'primaryType', 'domain', 'message']):
                     is_eip712 = True
                     data = decoded
-            except json.JSONDecodeError:
+            except (ValueError, json.JSONDecodeError):
                 pass
 
         if is_eip712:
             encoded = encode_typed_data(full_message=data)
         elif (isinstance(data, bytes)):
-            encoded = encode_defunct(bytes=data)
+            encoded = encode_defunct(data)
         elif data.startswith('0x'):
             encoded = encode_defunct(hexstr=data)
         else:
