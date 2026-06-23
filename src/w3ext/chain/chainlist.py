@@ -137,7 +137,13 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
         # Default timeout unless overridden
         self._request_kwargs.setdefault("timeout", 30)
         # Initialize parent with placeholder; will switch before each request attempt
-        super().__init__("http://localhost", self._request_kwargs)
+        super().__init__(
+            "http://localhost",
+            self._request_kwargs,
+            cache_allowed_requests=True,
+            cacheable_requests={"eth_chainId"},
+            request_cache_validation_threshold=60 * 60,
+        )
         # Disable built-in endpoint retry; rotation is handled here
         self._exception_retry_configuration = None
 

@@ -373,7 +373,13 @@ class Chain:
             if request_kwargs is None:
                 request_kwargs = {}
             request_kwargs.setdefault("timeout", 60)
-            provider = AsyncHTTPProvider(rpc, request_kwargs)
+            provider = AsyncHTTPProvider(
+                rpc,
+                request_kwargs,
+                cache_allowed_requests=True,
+                cacheable_requests={"eth_chainId"},
+                request_cache_validation_threshold=60 * 60,
+            )
 
         self.__web3.provider = provider
         await self._verify_chain_id(self.chain_id)
