@@ -22,4 +22,3 @@ class ChainException(Exception):
     Example:
         >>> raise ChainException("Failed to connect to RPC endpoint")
     """
-    pass

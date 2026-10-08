@@ -24,29 +24,29 @@ Example:
 
 # pylint: disable=no-name-in-module
 import json
-from contextlib import contextmanager, ExitStack
-from typing import TypeVar, Any, TYPE_CHECKING, Union, List, Iterator, Optional, NamedTuple, Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypeVar, Union, cast
 
-from eth_account.signers.local import LocalAccount
 from eth_account import Account as Web3Account
-from eth_account.messages import encode_defunct, SignableMessage
+from eth_account.datastructures import SignedMessage as EthSignedMessage
+from eth_account.messages import encode_defunct, encode_typed_data
+from eth_account.signers.local import LocalAccount
 from eth_typing import ChecksumAddress
-from web3.types import HexBytes
-try:
-    from eth_account.messages import encode_typed_data
-except ImportError:
-    from eth_account.messages import encode_structured_data
-    def encode_typed_data(*args, full_message: dict, **kwargs) -> SignableMessage:
-        return encode_structured_data(full_message)
+from hexbytes import HexBytes
 
 from .token import Token
+
 if TYPE_CHECKING:
     from .chain import Chain
     from .token import CurrencyAmount
 
-__all__ = ["Account", ]
+__all__ = [
+    "Account",
+]
 
 Self = TypeVar("Self")
+
 
 class SignedMessage(NamedTuple):
     """
@@ -59,6 +59,7 @@ class SignedMessage(NamedTuple):
         v: Recovery parameter
         signature: Complete signature as bytes
     """
+
     messageHash: HexBytes
     r: int
     s: int
@@ -85,16 +86,17 @@ class Account:
         >>> # Use with a chain
         >>> chain_account = account.use_chain(ethereum_chain)
     """
+
     # Checksum address of the account (set in from_key)
     address: ChecksumAddress
 
     def __init__(self) -> None:
         """Initialize an empty Account instance."""
         # Internal LocalAccount instance from eth_account
-        self._acc: LocalAccount = Web3Account()
+        self._acc: LocalAccount = cast(LocalAccount, Web3Account())
 
     @classmethod
-    def from_key(cls, key: str) -> 'Account':
+    def from_key(cls, key: str) -> "Account":
         """
         Create an Account from a private key.
 
@@ -110,7 +112,7 @@ class Account:
             >>> account = Account.from_key("0x1234567890abcdef...")
         """
         instance = cls()
-        key = key if key.startswith('0x') else f"0x{key}"
+        key = key if key.startswith("0x") else f"0x{key}"
         instance._acc = Web3Account.from_key(key)
         return instance
 
@@ -132,7 +134,9 @@ class Account:
         return ChainAccount(self, chain)
 
     @contextmanager
-    def onchain(self, *chains: "Chain") -> Iterator[Union["ChainAccount", List["ChainAccount"]]]:
+    def onchain(
+        self, *chains: "Chain"
+    ) -> Iterator[Union["ChainAccount", list["ChainAccount"]]]:
         """
         Context manager to temporarily add account signing to chains.
 
@@ -145,7 +149,9 @@ class Account:
             bound = [self.use_chain(chain) for chain in chains]
             yield bound[0] if len(bound) == 1 else bound
 
-    async def sign(self, data: Union[bytes, str, Mapping], hex_only=True) -> Union[SignedMessage, HexBytes]:
+    async def sign(
+        self, data: bytes | str | Mapping, hex_only=True
+    ) -> EthSignedMessage | HexBytes:
         """
         Sign arbitrary data with this account's private key.
 
@@ -181,26 +187,30 @@ class Account:
             >>> full_sig = await account.sign("Hello", hex_only=False)
             >>> print(full_sig.r, full_sig.s, full_sig.v)
         """
-        is_eip712 = isinstance(data, Mapping)
-        if not is_eip712:
+        typed_data: dict[str, Any] | None = (
+            dict(data) if isinstance(data, Mapping) else None
+        )
+        if typed_data is None and isinstance(data, (str, bytes)):
             try:
                 decoded = json.loads(data)
-                if all(map(lambda key: key in decoded),
-                       ['types', 'primaryType', 'domain', 'message']):
-                    is_eip712 = True
-                    data = decoded
-            except (ValueError, json.JSONDecodeError):
+                if isinstance(decoded, dict) and all(
+                    key in decoded
+                    for key in ("types", "primaryType", "domain", "message")
+                ):
+                    typed_data = decoded
+            except (TypeError, ValueError):
                 pass
 
-        if is_eip712:
-            encoded = encode_typed_data(full_message=data)
-        elif (isinstance(data, bytes)):
+        if typed_data is not None:
+            encoded = encode_typed_data(full_message=typed_data)
+        elif isinstance(data, bytes):
             encoded = encode_defunct(data)
-        elif data.startswith('0x'):
+        elif isinstance(data, str) and data.startswith("0x"):
             encoded = encode_defunct(hexstr=data)
-        else:
-            # by default encode it as a simple text
+        elif isinstance(data, str):
             encoded = encode_defunct(text=data)
+        else:
+            raise TypeError("Signing data must be bytes, text, or EIP-712 typed data")
         signed = self._acc.sign_message(encoded)
 
         return signed.signature if hex_only else signed
@@ -255,9 +265,9 @@ class ChainAccount:
             chain: Chain instance to bind to
         """
         # The underlying Account instance
-        self._account: "Account" = account
+        self._account: Account = account
         # The Chain instance this account is bound to
-        self._chain: "Chain" = chain
+        self._chain: Chain = chain
 
     def chain(self) -> "Chain":
         """
@@ -268,7 +278,7 @@ class ChainAccount:
         """
         return self._chain
 
-    async def get_balance(self, token: Optional['Token'] = None) -> 'CurrencyAmount':
+    async def get_balance(self, token: Optional["Token"] = None) -> "CurrencyAmount":
         """
         Get balance for this account.
 
@@ -291,7 +301,8 @@ class ChainAccount:
             >>> print(f"USDC: {usdc_balance.to_fixed(2)}")
         """
         return await (
-            token.get_balance(self.address) if isinstance(token, Token)
+            token.get_balance(self.address)
+            if isinstance(token, Token)
             else self._chain.get_balance(self.address)
         )
 

@@ -6,45 +6,47 @@ This module provides classes for handling currencies, tokens, and their amounts
 with proper decimal handling and arithmetic operations. It includes support for
 both native currencies (like ETH) and ERC20 tokens.
 """
+
 from decimal import Decimal
-from numbers import Number
-from typing import Optional, Any, Union, TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Any, Generic, Self, TypeVar, Union, cast
 
 from eth_typing import HexAddress
-from web3.types import TxParams, HexBytes
-from .utils import to_checksum_address
+from hexbytes import HexBytes
+from web3 import Web3
+from web3.types import TxParams
+
 if TYPE_CHECKING:
     from .account import Account
     from .contract import Contract
 
-__all__ = ['Currency', 'Token', 'CurrencyAmount', 'TokenAmount']
+__all__ = ["Currency", "CurrencyAmount", "Token", "TokenAmount"]
 
 
 UNIT_MULTIPLIERS = {
-    'wei': 1,
-    'kwei': 10 ** 3,
-    'babbage': 10 ** 3,
-    'mwei': 10 ** 6,
-    'lovelace': 10 ** 6,
-    'gwei': 10 ** 9,
-    'shannon': 10 ** 9,
-    'microether': 10 ** 12,
-    'szabo': 10 ** 12,
-    'milliether': 10 ** 15,
-    'finney': 10 ** 15,
-    'ether': 10 ** 18,
-    'kether': 10 ** 21,
-    'grand': 10 ** 21,
-    'mether': 10 ** 24,
-    'gether': 10 ** 27,
-    'tether': 10 ** 30,
+    "wei": 1,
+    "kwei": 10**3,
+    "babbage": 10**3,
+    "mwei": 10**6,
+    "lovelace": 10**6,
+    "gwei": 10**9,
+    "shannon": 10**9,
+    "microether": 10**12,
+    "szabo": 10**12,
+    "milliether": 10**15,
+    "finney": 10**15,
+    "ether": 10**18,
+    "kether": 10**21,
+    "grand": 10**21,
+    "mether": 10**24,
+    "gether": 10**27,
+    "tether": 10**30,
 }
 
 
 def _from_unit(amount: float, unit: str) -> int:
     """Convert amount in given unit to wei."""
     if unit not in UNIT_MULTIPLIERS:
-        valid_units = ', '.join(UNIT_MULTIPLIERS.keys())
+        valid_units = ", ".join(UNIT_MULTIPLIERS.keys())
         raise ValueError(f"Unknown unit '{unit}'. Valid units: {valid_units}")
     return int(amount * UNIT_MULTIPLIERS[unit])
 
@@ -52,7 +54,7 @@ def _from_unit(amount: float, unit: str) -> int:
 def _to_unit(amount: int, unit: str) -> float:
     """Convert amount in wei to given unit."""
     if unit not in UNIT_MULTIPLIERS:
-        valid_units = ', '.join(UNIT_MULTIPLIERS.keys())
+        valid_units = ", ".join(UNIT_MULTIPLIERS.keys())
         raise ValueError(f"Unknown unit '{unit}'. Valid units: {valid_units}")
     return amount / UNIT_MULTIPLIERS[unit]
 
@@ -72,10 +74,7 @@ class Currency:
     """
 
     def __init__(
-        self,
-        name: str,
-        symbol: Optional[str] = None,
-        decimals: int = 18
+        self, name: str, symbol: str | None = None, decimals: int = 18
     ) -> None:
         """
         Initialize a Currency instance.
@@ -89,7 +88,7 @@ class Currency:
         self.symbol = symbol or name
         self.decimals = decimals
 
-    def to_amount(self, amount: int) -> 'CurrencyAmount':
+    def to_amount(self, amount: int) -> "CurrencyAmount":
         """
         Create a CurrencyAmount using the raw amount value.
 
@@ -101,11 +100,7 @@ class Currency:
         """
         return CurrencyAmount(self, amount)
 
-    def parse_amount(
-        self,
-        amount: float,
-        unit: Optional[str] = None
-    ) -> 'CurrencyAmount':
+    def parse_amount(self, amount: float, unit: str | None = None) -> "CurrencyAmount":
         """
         Convert human-readable amount to CurrencyAmount.
 
@@ -133,7 +128,7 @@ class Currency:
             >>> amount3 = usdc.parse_amount(100.5)  # Uses 6 decimals
         """
         if unit is None:
-            raw_amount = int(amount * 10 ** self.decimals)
+            raw_amount = int(amount * 10**self.decimals)
         else:
             if self.decimals != 18:
                 raise ValueError(
@@ -142,16 +137,20 @@ class Currency:
                 )
             raw_amount = _from_unit(amount, unit)
         return CurrencyAmount(self, raw_amount)
+
     __call__ = parse_amount
 
     def __str__(self) -> str:
         return self.symbol or self.name
+
     def __repr__(self) -> str:
         return str(self)
+
     def __hash__(self) -> int:
         return hash(self.name + self.symbol)
-    def __eq__(self, value: Self) -> bool:
-        return hash(self) == hash(value)
+
+    def __eq__(self, value: object) -> bool:
+        return isinstance(value, Currency) and hash(self) == hash(value)
 
 
 class Token(Currency):
@@ -173,14 +172,14 @@ class Token(Currency):
     """
 
     # Maximum approval amount (2^256 - 1) used for unlimited approvals
-    MAX_AMOUNT = '0x' + 'f' * 64
+    MAX_AMOUNT = "0x" + "f" * 64
 
     def __init__(
         self,
         contract: "Contract",
         name: str,
-        symbol: Optional[str] = None,
-        decimals: int = 18
+        symbol: str | None = None,
+        decimals: int = 18,
     ) -> None:
         """
         Initialize a Token instance.
@@ -207,7 +206,7 @@ class Token(Currency):
         """Get the chain ID where this token exists."""
         return self.contract.chain_id
 
-    def to_amount(self, amount: int) -> 'TokenAmount':
+    def to_amount(self, amount: int) -> "TokenAmount":
         """
         Create a TokenAmount using the raw amount value.
 
@@ -219,11 +218,7 @@ class Token(Currency):
         """
         return TokenAmount(self, amount)
 
-    def parse_amount(
-        self,
-        amount: float,
-        unit: Optional[str] = None
-    ) -> 'TokenAmount':
+    def parse_amount(self, amount: float, unit: str | None = None) -> "TokenAmount":
         """
         Convert human-readable amount to TokenAmount.
 
@@ -251,7 +246,7 @@ class Token(Currency):
             >>> amount3 = usdc.parse_amount(100.5)  # Uses 6 decimals
         """
         if unit is None:
-            raw_amount = int(amount * 10 ** self.decimals)
+            raw_amount = int(amount * 10**self.decimals)
         else:
             if self.decimals != 18:
                 raise ValueError(
@@ -260,6 +255,7 @@ class Token(Currency):
                 )
             raw_amount = _from_unit(amount, unit)
         return TokenAmount(self, raw_amount)
+
     __call__ = parse_amount
 
     async def get_balance(self, address: Union[HexAddress, "Account"]) -> "TokenAmount":
@@ -278,15 +274,17 @@ class Token(Currency):
             >>> print(f"Balance: {balance.to_fixed(2)} USDC")
         """
         address = cast(HexAddress, str(address))
-        amount = await self.contract.functions.balanceOf(to_checksum_address(address)).call()
+        amount = await self.contract.functions.balanceOf(
+            Web3.to_checksum_address(address)
+        ).call()
         return TokenAmount(self, amount)
 
     async def approve(
         self,
         account: "Account",
         spender: HexAddress,
-        amount: Optional[Union[int, 'TokenAmount']] = None,
-        transaction: Optional[TxParams] = None
+        amount: Union[int, "TokenAmount"] | None = None,
+        transaction: TxParams | None = None,
     ) -> HexBytes:
         """
         Approve another address to spend tokens on behalf of account.
@@ -308,14 +306,20 @@ class Token(Currency):
             >>> # Unlimited approval
             >>> tx_hash = await usdc.approve(my_account, uniswap_router)
         """
-        amount = (int(self.MAX_AMOUNT, 16) if amount is None
-                  else (amount if isinstance(amount, TokenAmount)
-                        else self.parse_amount(amount)).amount)
-        return await self.contract.functions \
-            .approve(to_checksum_address(spender), amount) \
-            .transact(account, transaction)
+        amount = (
+            int(self.MAX_AMOUNT, 16)
+            if amount is None
+            else (
+                amount if isinstance(amount, TokenAmount) else self.parse_amount(amount)
+            ).amount
+        )
+        return await self.contract.functions.approve(
+            Web3.to_checksum_address(spender), amount
+        ).transact(account, transaction)
 
-    async def get_allowance(self, owner: HexAddress, spender: HexAddress) -> 'TokenAmount':
+    async def get_allowance(
+        self, owner: HexAddress, spender: HexAddress
+    ) -> "TokenAmount":
         """
         Get the amount a spender is allowed to spend on behalf of owner.
 
@@ -332,9 +336,9 @@ class Token(Currency):
             >>> allowance = await usdc.get_allowance(my_account.address, uniswap_router)
             >>> print(f"Allowance: {allowance.to_fixed(2)} USDC")
         """
-        allowance = await self.contract.functions \
-            .allowance(to_checksum_address(owner), to_checksum_address(spender)) \
-            .call()
+        allowance = await self.contract.functions.allowance(
+            Web3.to_checksum_address(owner), Web3.to_checksum_address(spender)
+        ).call()
         return TokenAmount(self, allowance)
 
     def __getattr__(self, name) -> Any:
@@ -355,10 +359,13 @@ class Token(Currency):
 
     def __hash__(self) -> int:
         """Generate hash based on chain ID and contract address for use in sets/dicts."""
-        return hash(self.chain_id + ":" + to_checksum_address(self.address))
+        return hash(self.chain_id + ":" + Web3.to_checksum_address(self.address))
 
 
-class CurrencyAmount:
+CurrencyType = TypeVar("CurrencyType", bound=Currency)
+
+
+class CurrencyAmount(Generic[CurrencyType]):
     """
     Represents an amount of a specific currency with proper decimal handling.
 
@@ -377,10 +384,11 @@ class CurrencyAmount:
         >>> total = amount1 + amount2  # Safe arithmetic
         >>> print(total.to_fixed(2))  # "2.50"
     """
-    currency: Currency
+
+    currency: CurrencyType
     amount: int
 
-    def __init__(self, currency: Currency, amount: Union[int, str]) -> None:
+    def __init__(self, currency: CurrencyType, amount: int | str) -> None:
         """
         Initialize a CurrencyAmount.
 
@@ -393,16 +401,18 @@ class CurrencyAmount:
         """
         self.currency = currency
         if isinstance(amount, str):
-            amount = int(amount, 16 if amount.startswith('0x') else 10)
+            amount = int(amount, 16 if amount.startswith("0x") else 10)
         self.amount = int(amount)
 
-    def _to_amount(self: Self, val: Union[str, int, "CurrencyAmount"]) -> "CurrencyAmount":
+    def _to_amount(
+        self: Self, val: Union[str, int, "CurrencyAmount"]
+    ) -> "CurrencyAmount":
         """Convert various types to CurrencyAmount for internal operations."""
         if not isinstance(val, CurrencyAmount):
             return self.__class__(self.currency, val)
         return val
 
-    def _new_amount(self: Self, amount: Union[int, str]) -> Self:
+    def _new_amount(self: Self, amount: int | str) -> Self:
         """Create a new amount instance with the same currency."""
         return self.__class__(self.currency, amount)
 
@@ -424,6 +434,7 @@ class CurrencyAmount:
             >>> print(total.to_fixed(1))  # "1.5"
         """
         return self._new_amount(self.amount + self._to_amount(other).amount)
+
     __radd__ = __add__
 
     def __sub__(self: Self, other: Self) -> Self:
@@ -444,9 +455,10 @@ class CurrencyAmount:
             >>> print(diff.to_fixed(1))  # "1.5"
         """
         return self._new_amount(self.amount - self._to_amount(other).amount)
+
     __rsub__ = __sub__
 
-    def __mul__(self: Self, other: Union[Self, Number]) -> Self:
+    def __mul__(self: Self, other: Self | float | Decimal) -> Self:
         """
         Multiply currency amount by a number or another amount.
 
@@ -462,12 +474,19 @@ class CurrencyAmount:
             >>> doubled = amount * 2  # 3.0 ETH
             >>> print(doubled.to_fixed(1))  # "3.0"
         """
-        if isinstance(other, Number):
+        if isinstance(other, (int, float, Decimal)):
             return self._new_amount(int(self.amount * other))
-        return self._new_amount(int(self.amount * self._to_amount(other).amount / 10 ** other.currency.decimals))
+        return self._new_amount(
+            int(
+                self.amount
+                * self._to_amount(other).amount
+                / 10**other.currency.decimals
+            )
+        )
+
     __rmul__ = __mul__
 
-    def __truediv__(self: Self, other: Self) -> Self:
+    def __truediv__(self: Self, other: Self | float | Decimal) -> Self:
         """
         Divide currency amount by a number or another amount.
 
@@ -483,9 +502,16 @@ class CurrencyAmount:
             >>> half = amount / 2     # 1.5 ETH
             >>> print(half.to_fixed(1))  # "1.5"
         """
-        if isinstance(other, Number):
+        if isinstance(other, (int, float, Decimal)):
             return self._new_amount(int(self.amount / other))
-        return self._new_amount(int(self.amount / self._to_amount(other).amount / 10 ** other.currency.decimals))
+        return self._new_amount(
+            int(
+                self.amount
+                / self._to_amount(other).amount
+                / 10**other.currency.decimals
+            )
+        )
+
     __rtruediv__ = __truediv__
 
     def __neg__(self: Self) -> Self:
@@ -662,11 +688,7 @@ class CurrencyAmount:
         """
         return str(self)
 
-    def to_fixed(
-        self,
-        decimals: int = 3,
-        unit: Optional[str] = None
-    ) -> float:
+    def to_fixed(self, decimals: int = 3, unit: str | None = None) -> float:
         """
         Convert to human-readable decimal format.
 
@@ -692,7 +714,7 @@ class CurrencyAmount:
             >>> print(usdc_amount.to_fixed(2))  # 100.50 (using 6 decimals)
         """
         if unit is None:
-            value = self.amount / 10 ** self.currency.decimals
+            value = self.amount / 10**self.currency.decimals
         else:
             if self.currency.decimals != 18:
                 raise ValueError(
@@ -702,11 +724,7 @@ class CurrencyAmount:
             value = _to_unit(self.amount, unit)
         return round(value, decimals)
 
-    def to_sigfrac(
-        self,
-        digits: int = 3,
-        unit: Optional[str] = None
-    ) -> str:
+    def to_sigfrac(self, digits: int = 3, unit: str | None = None) -> str:
         """
         Integer part unchanged.
         Fractional part: keep all leading zeros, then up to `digits` digits
@@ -736,7 +754,7 @@ class CurrencyAmount:
             >>> print(usdc_amount.to_sigfrac())  # "100.000123" (using 6 decimals)
         """
         if unit is None:
-            value = self.amount / 10 ** self.currency.decimals
+            value = self.amount / 10**self.currency.decimals
         else:
             if self.currency.decimals != 18:
                 raise ValueError(
@@ -745,27 +763,27 @@ class CurrencyAmount:
                 )
             value = _to_unit(self.amount, unit)
         d = Decimal(str(value))
-        sign = '-' if d.is_signed() else ''
+        sign = "-" if d.is_signed() else ""
         d = abs(d)
 
-        s = format(d, 'f')  # no exponent, plain decimal string
-        if '.' not in s:
+        s = format(d, "f")  # no exponent, plain decimal string
+        if "." not in s:
             return sign + s
 
-        int_part, frac_part = s.split('.', 1)
+        int_part, frac_part = s.split(".", 1)
 
         # all zeros after decimal → return integer only
-        if frac_part.strip('0') == '':
+        if frac_part.strip("0") == "":
             return sign + int_part
 
         # keep all leading zeros before the first non-zero
-        i = next(idx for idx, ch in enumerate(frac_part) if ch != '0')
+        i = next(idx for idx, ch in enumerate(frac_part) if ch != "0")
         keep_zeros = frac_part[:i]
-        rest = frac_part[i:i+digits]  # up to N digits after the first non-zero
-        return sign + int_part + '.' + keep_zeros + rest
+        rest = frac_part[i : i + digits]  # up to N digits after the first non-zero
+        return sign + int_part + "." + keep_zeros + rest
 
 
-class TokenAmount(CurrencyAmount):
+class TokenAmount(CurrencyAmount[Token]):
     """
     Represents an amount of a specific ERC20 token with blockchain operations.
 
@@ -785,9 +803,10 @@ class TokenAmount(CurrencyAmount):
         >>> # Approve spending
         >>> approve_hash = amount.approve(account, "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984")
     """
-    currency: Token
 
-    async def transfer(self, account: "Account", to: str, *, tx: Optional[TxParams] = None) -> HexBytes:
+    async def transfer(
+        self, account: "Account", to: str, *, tx: TxParams | None = None
+    ) -> HexBytes:
         """
         Transfer this token amount to another address.
 
@@ -805,15 +824,15 @@ class TokenAmount(CurrencyAmount):
             >>> tx_hash = await amount.transfer(my_account, "0x742d35Cc...")
             >>> print(f"Transfer sent: {tx_hash.hex()}")
         """
-        return await self.currency.functions \
-            .transfer(to, self.amount) \
-            .transact(account, tx)
+        return await self.currency.functions.transfer(to, self.amount).transact(
+            account, tx
+        )
 
-    def approve(
+    async def approve(
         self,
         account: "Account",
         spender: HexAddress,
-        transaction: Optional[TxParams] = None
+        transaction: TxParams | None = None,
     ) -> HexBytes:
         """
         Approve another address to spend this token amount.
@@ -833,4 +852,4 @@ class TokenAmount(CurrencyAmount):
             >>> tx_hash = amount.approve(my_account, uniswap_router)
             >>> print(f"Approval sent: {tx_hash.hex()}")
         """
-        return self.currency.approve(account, spender, self, transaction)
+        return await self.currency.approve(account, spender, self, transaction)

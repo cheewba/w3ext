@@ -24,3 +24,13 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = {attr = "w3ext.__version__"}
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["src"]
+exclude = ["build", "dist"]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+target-version = "py311"

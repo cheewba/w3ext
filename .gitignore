@@ -1,10 +1,37 @@
-.env
-__pycache__
-.vscode
-.mypy_cache
+# Python bytecode and native extensions
+__pycache__/
+*.py[cod]
+*.so
+
+# Packaging output
 build/
 dist/
 *.egg-info/
-.DS_store
-.roo
-.pytest*
+*.egg
+.eggs/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Test, coverage, and type-checking output
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Editors and operating system files
+.idea/
+.vscode/
+.DS_Store
+.roo/

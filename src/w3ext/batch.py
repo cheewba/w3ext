@@ -31,13 +31,14 @@ Example:
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from functools import wraps
-from typing import Callable, TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from web3 import AsyncWeb3
-from web3.method import Method, RPC_METHODS_UNSUPPORTED_DURING_BATCH
-
+from web3._utils.batching import RPC_METHODS_UNSUPPORTED_DURING_BATCH
+from web3.method import Method
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -45,12 +46,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_batch_request_processed = ContextVar[bool]('_batch_request_processed', default=False)
+_batch_request_processed = ContextVar[bool]("_batch_request_processed", default=False)
 
 
 def _dummy_checker(self):
     """Dummy validation function to bypass web3's batch validation."""
-    pass
 
 
 def to_batch_aware_method(chain: "Chain", method: Callable):
@@ -74,6 +74,7 @@ def to_batch_aware_method(chain: "Chain", method: Callable):
         ...     # This will be batched when chain._is_batching is True
         ...     return await original_method(address)
     """
+
     @wraps(method)
     async def wrapper(*args, **kwargs):
         if chain._is_batching and not _batch_request_processed.get():
@@ -114,26 +115,33 @@ def is_batch_method(instance, attrname):
         >>> is_batch_method(web3_instance.eth, 'get_balance')  # True
         >>> is_batch_method(web3_instance.eth, 'accounts')     # False (property)
     """
+
     def hasspecialmethod(obj, name):
         return any(name in klass.__dict__ for klass in type(obj).__mro__)
+
     for klass in type(instance).__mro__:
         if attrname in klass.__dict__:
             descriptor = klass.__dict__[attrname]
-            if not (hasspecialmethod(descriptor, '__get__') or
-                    hasspecialmethod(descriptor, '__set__') or
-                    hasspecialmethod(descriptor, '__delete__')):
+            if not (
+                hasspecialmethod(descriptor, "__get__")
+                or hasspecialmethod(descriptor, "__set__")
+                or hasspecialmethod(descriptor, "__delete__")
+            ):
                 # Attribute isn't a descriptor
                 return False
-            if (attrname in instance.__dict__ and
-                not hasspecialmethod(descriptor, '__set__') and
-                not hasspecialmethod(descriptor, '__delete__')):
+            if (
+                attrname in instance.__dict__
+                and not hasspecialmethod(descriptor, "__set__")
+                and not hasspecialmethod(descriptor, "__delete__")
+            ):
                 # Would be handled by the descriptor, but the descriptor isn't
                 # a data descriptor and the object has a dict entry overriding
                 # it.
                 return False
             return (
                 isinstance(descriptor, Method)
-                and descriptor.json_rpc_method not in RPC_METHODS_UNSUPPORTED_DURING_BATCH
+                and descriptor.json_rpc_method
+                not in RPC_METHODS_UNSUPPORTED_DURING_BATCH
                 # for now skip properties
                 and not descriptor.is_property
             )
@@ -173,7 +181,7 @@ class Batch:
         *,
         max_size: int = 20,
         max_wait: float = 0.1,
-        timeout: Optional[float] = 60
+        timeout: float | None = 60,
     ) -> None:
         """
         Initialize a new Batch processor.
@@ -192,7 +200,7 @@ class Batch:
 
         self._batcher = None
         self._batch_started = None
-        self._validator: asyncio.Task = None
+        self._validator: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
     async def _add_request_info(self, request_info):
@@ -247,11 +255,15 @@ class Batch:
         """
         async with self._lock:
             # if self._batcher is not None:
-            if (cancel
-                    or (self._max_size and len(self._requests) >= self._max_size)
-                    or (self._max_wait
-                            and self._batch_started
-                            and time.time() - self._batch_started >= self._max_wait)):
+            if (
+                cancel
+                or (self._max_size and len(self._requests) >= self._max_size)
+                or (
+                    self._max_wait
+                    and self._batch_started
+                    and time.time() - self._batch_started >= self._max_wait
+                )
+            ):
                 await self._process_batch()
                 self._batch_started = None
 
@@ -309,7 +321,9 @@ class Batch:
             # batching = self._web3.provider._is_batching
             batcher = self._web3.batch_requests()
             # self._web3.provider._is_batching = batching
-            batcher._validate_is_batching = _dummy_checker.__get__(batcher, batcher.__class__)
+            batcher._validate_is_batching = _dummy_checker.__get__(
+                batcher, batcher.__class__
+            )
 
             for request in requests:
                 batcher.add(request)
@@ -327,7 +341,7 @@ class Batch:
                             future.set_result(response)
             except Exception as e:
                 # If batch fails, fail all futures
-                logger.exception(e)
+                logger.exception("Batch execution failed")
                 for future in futures:
                     if not future.done():
                         future.set_exception(e)
@@ -335,8 +349,8 @@ class Batch:
         # Process all requests in batches
         tasks = []
         while len(self._requests):
-            requests, futures = list(zip(*self._requests[:self._max_size]))
-            self._requests = self._requests[len(requests):]
+            requests, futures = list(zip(*self._requests[: self._max_size]))
+            self._requests = self._requests[len(requests) :]
             tasks.append(process(requests, futures))
 
         await asyncio.gather(*tasks)

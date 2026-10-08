@@ -29,36 +29,38 @@ Example:
     >>> hash_result = keccak256('0x1234abcd')
 """
 
+from __future__ import annotations
+
 # pylint: disable=no-name-in-module
+import asyncio
 import json
-from cytoolz.dicttoolz import assoc
-from typing import Any, Callable, Collection, Union, cast, TYPE_CHECKING, Optional, Dict
+from collections.abc import Callable, Collection
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import aiohttp
+from cytoolz.dicttoolz import assoc
+from cytoolz.functoolz import curry
 from eth_account.signers.local import LocalAccount
 from eth_keys.datatypes import PrivateKey
 from eth_typing import ChecksumAddress, HexStr
-from eth_utils.toolz import curry
 from eth_utils.crypto import keccak
 from web3 import AsyncWeb3, Web3
+from web3._utils.async_transactions import async_fill_transaction_defaults
 from web3.middleware import Web3Middleware
 from web3.middleware.signing import format_transaction, gen_normalized_accounts
-from web3.types import RPCEndpoint, RPCResponse, TxParams
-try:
-    from web3._utils.async_transactions import async_fill_transaction_defaults as fill_transaction_defaults
-except ImportError:
-    from web3._utils.async_transactions import fill_transaction_defaults as fill_transaction_defaults
+from web3.types import RPCEndpoint, RPCResponse, TxParams, Wei
 
 if TYPE_CHECKING:
     from ..chain import Chain
 
 
-_PrivateKey = Union[LocalAccount, PrivateKey, HexStr, bytes]
+_PrivateKey = LocalAccount | PrivateKey | HexStr | bytes
 
 to_checksum_address = AsyncWeb3.to_checksum_address
 
 
-async def load_abi(filename: str, process: Optional[Callable] = None) -> str:
+async def load_abi(filename: str, process: Callable | None = None) -> str:
     """
     Load contract ABI from file or URL.
 
@@ -84,13 +86,14 @@ async def load_abi(filename: str, process: Optional[Callable] = None) -> str:
         >>> # Load with processing
         >>> abi = await load_abi('contract.json', lambda x: x['abi'])
     """
-    if (filename.startswith('http')):
-        async with aiohttp.ClientSession() as session:
-            async with session.get(filename) as resp:
-                abi = await resp.json()
+    if filename.startswith("http"):
+        async with (
+            aiohttp.ClientSession() as session,
+            session.get(filename) as resp,
+        ):
+            abi = await resp.json()
     else:
-        with open(filename) as f:
-            abi = json.load(f)
+        abi = json.loads(await asyncio.to_thread(Path(filename).read_text))
 
     if process is not None:
         abi = process(abi)
@@ -98,7 +101,7 @@ async def load_abi(filename: str, process: Optional[Callable] = None) -> str:
     return abi
 
 
-async def is_eip1559(w3: 'AsyncWeb3'):
+async def is_eip1559(w3: AsyncWeb3):
     """
     Check if the network supports EIP-1559 (London hard fork).
 
@@ -119,11 +122,11 @@ async def is_eip1559(w3: 'AsyncWeb3'):
         ...     # Use legacy gasPrice
         ...     tx['gasPrice'] = 20000000000
     """
-    fee = await w3.eth.fee_history(1, 'latest')
-    return fee['baseFeePerGas'][0] != 0
+    fee = await w3.eth.fee_history(1, "latest")
+    return fee["baseFeePerGas"][0] != 0
 
 
-async def get_gas_price(w3: 'Chain') -> int:
+async def get_gas_price(w3: Chain) -> int:
     """
     Get the current gas price for transactions.
 
@@ -141,18 +144,16 @@ async def get_gas_price(w3: 'Chain') -> int:
         >>> gas_price = await get_gas_price(chain)
         >>> print(f"Gas price: {gas_price} wei")
     """
-    _eip1559 = await (
-        w3.is_eip1559() if hasattr(w3, 'is_eip1559') else is_eip1559(w3)
-    )
+    _eip1559 = await w3.is_eip1559()
     if _eip1559:
-        base_fee = (await w3.eth.get_block('latest'))['baseFeePerGas']
+        base_fee = (await w3.eth.get_block("latest"))["baseFeePerGas"]
         priority_fee = await w3.eth.max_priority_fee
         return base_fee + priority_fee
     else:
         return await w3.eth.gas_price
 
 
-async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
+async def fill_gas_price(w3: AsyncWeb3 | Chain, transaction: TxParams) -> TxParams:
     """
     Fill gas price in a transaction if not already set.
 
@@ -166,25 +167,30 @@ async def fill_gas_price(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams)
     Returns:
         The transaction dictionary with gas price parameters filled.
     """
-    _eip1559 = await (w3.is_eip1559() if hasattr(w3, 'is_eip1559') else is_eip1559(w3))
+    _eip1559 = await (is_eip1559(w3) if isinstance(w3, AsyncWeb3) else w3.is_eip1559())
     if _eip1559:
-        if 'maxFeePerGas' not in transaction or 'maxPriorityFeePerGas' not in transaction:
-            base_fee = (await w3.eth.get_block('latest'))['baseFeePerGas']
+        if (
+            "maxFeePerGas" not in transaction
+            or "maxPriorityFeePerGas" not in transaction
+        ):
+            base_fee = (await w3.eth.get_block("latest")).get("baseFeePerGas")
+            if base_fee is None:
+                raise ValueError("Latest block has no base fee")
             priority_fee = await w3.eth.max_priority_fee
-            transaction['maxPriorityFeePerGas'] = priority_fee
-            transaction['maxFeePerGas'] = int(base_fee * 1.2) + priority_fee
-    elif 'gasPrice' not in transaction:
-        transaction['gasPrice'] = await w3.eth.gas_price
+            transaction["maxPriorityFeePerGas"] = priority_fee
+            transaction["maxFeePerGas"] = Wei(int(base_fee * 1.2) + priority_fee)
+    elif "gasPrice" not in transaction:
+        transaction["gasPrice"] = await w3.eth.gas_price
 
     return transaction
 
 
-async def fill_chain_id(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
+async def fill_chain_id(w3: AsyncWeb3 | Chain, transaction: TxParams) -> TxParams:
     """
     Fill chain ID in transaction if not already set.
 
     Automatically sets the chainId parameter based on the connected network.
-    Ensures the chain ID is properly formatted as a hex string.
+    Stores the chain ID as an integer, as required by Web3 transaction types.
 
     Args:
         w3: AsyncWeb3 or Chain instance
@@ -198,19 +204,22 @@ async def fill_chain_id(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) 
         >>> tx = await fill_chain_id(w3, tx)
         >>> # tx now has 'chainId' set to current network's chain ID
     """
-    if transaction.get("chainId") is None:
+    if (chain_id := transaction.get("chainId")) is not None:
+        transaction["chainId"] = (
+            int(chain_id, 16)
+            if isinstance(chain_id, str) and chain_id.startswith("0x")
+            else int(chain_id)
+        )
+    else:
         if isinstance(w3, AsyncWeb3):
-            transaction['chainId'] = hex(int(await w3.eth.chain_id))
-        elif (chain_id := getattr(w3, 'chain_id', None)) is not None:
-            transaction['chainId'] = hex(int(chain_id))
-    if ((chain_id := transaction.get('chainId')) is not None
-            and not str(chain_id).startswith('0x')):
-        transaction['chainId'] = hex(int(chain_id))
+            transaction["chainId"] = int(await w3.eth.chain_id)
+        elif (chain_id := getattr(w3, "chain_id", None)) is not None:
+            transaction["chainId"] = int(chain_id)
     return transaction
 
 
 @curry
-async def fill_nonce(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> TxParams:
+async def fill_nonce(w3: AsyncWeb3 | Chain, transaction: TxParams) -> TxParams:
     """
     Fill nonce in transaction if not already set.
 
@@ -233,12 +242,12 @@ async def fill_nonce(w3: Union['AsyncWeb3', 'Chain'], transaction: TxParams) -> 
         >>> fill_nonce_for_w3 = fill_nonce(w3)
         >>> tx = await fill_nonce_for_w3(tx)
     """
-    if 'from' in transaction and 'nonce' not in transaction:
+    if "from" in transaction and "nonce" not in transaction:
         return assoc(
             transaction,
-            'nonce',
+            "nonce",
             await w3.eth.get_transaction_count(  # type: ignore
-                cast(ChecksumAddress, transaction['from'])
+                cast(ChecksumAddress, transaction["from"])
             ),
         )
     return transaction
@@ -265,7 +274,8 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
     def __init__(
         self,
         w3: AsyncWeb3,
-        accounts: Union[Dict[ChecksumAddress, LocalAccount], Callable[[], Dict[ChecksumAddress, LocalAccount]]],
+        accounts: dict[ChecksumAddress, LocalAccount]
+        | Callable[[], dict[ChecksumAddress, LocalAccount]],
     ) -> None:
         """
         Initialize the signing middleware.
@@ -277,8 +287,10 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
                       - a callable returning such dict (evaluated per request)
         """
         super().__init__(w3)
-        self._accounts: Dict[ChecksumAddress, LocalAccount] = {}
-        self._accounts_fn: Optional[Callable[[], Dict[ChecksumAddress, LocalAccount]]] = None
+        self._accounts: dict[ChecksumAddress, LocalAccount] = {}
+        self._accounts_fn: Callable[[], dict[ChecksumAddress, LocalAccount]] | None = (
+            None
+        )
         if callable(accounts):
             # when callable passed, we will call it on each request to fetch active accounts
             self._accounts_fn = accounts
@@ -298,37 +310,45 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
         Returns:
             Wrapped request handler
         """
+
         async def middleware(method: RPCEndpoint, params: Any) -> RPCResponse:
-            if method != 'eth_sendTransaction':
+            if method != "eth_sendTransaction":
                 return await make_request(method, params)
 
+            w3 = cast(AsyncWeb3, self._w3)
             transaction = params[0]
-            transaction = await fill_chain_id(self._w3, transaction)
-            transaction = await fill_nonce(self._w3, transaction)
-            transaction = await fill_transaction_defaults(self._w3, transaction)
-            transaction = await fill_gas_price(self._w3, transaction)
+            transaction = await fill_chain_id(w3, transaction)
+            transaction = await fill_nonce(w3, transaction)
+            transaction = await async_fill_transaction_defaults(w3, transaction)
+            transaction = await fill_gas_price(w3, transaction)
             transaction = format_transaction(transaction)
 
-            if 'from' not in transaction:
+            if "from" not in transaction:
                 return await make_request(method, params)
 
-            accounts = self._accounts_fn() if getattr(self, "_accounts_fn", None) else self._accounts
-            sender = transaction.get('from')
+            accounts = (
+                self._accounts_fn() if self._accounts_fn is not None else self._accounts
+            )
+            sender = transaction.get("from")
+            if sender is None:
+                return await make_request(method, params)
+            sender = to_checksum_address(sender)
             if sender not in accounts:
                 return await make_request(method, params)
 
             # pylint: disable=unsubscriptable-object
             account = accounts[sender]
-            raw_tx = account.sign_transaction(transaction).raw_transaction
+            raw_tx = account.sign_transaction(cast(Any, transaction)).raw_transaction
 
-            return await make_request(RPCEndpoint('eth_sendRawTransaction'),
-                                      [AsyncWeb3.to_hex(raw_tx)])
+            return await make_request(
+                RPCEndpoint("eth_sendRawTransaction"), [AsyncWeb3.to_hex(raw_tx)]
+            )
 
         return middleware
 
 
 def construct_async_sign_and_send_raw_middleware(
-    private_key_or_account: Union[_PrivateKey, Collection[_PrivateKey]]
+    private_key_or_account: _PrivateKey | Collection[_PrivateKey],
 ) -> Callable[[AsyncWeb3], AsyncSignSendRawMiddleware]:
     """
     Create middleware for automatic transaction signing.
@@ -356,13 +376,18 @@ def construct_async_sign_and_send_raw_middleware(
         >>> middleware = construct_async_sign_and_send_raw_middleware([key1, key2, key3])
         >>> w3.middleware_onion.add(middleware)
     """
-    accounts = gen_normalized_accounts(private_key_or_account)
-    def middleware(w3: AsyncWeb3 | Web3):
+    accounts = cast(
+        dict[ChecksumAddress, LocalAccount],
+        gen_normalized_accounts(private_key_or_account),
+    )
+
+    def middleware(w3: AsyncWeb3):
         return AsyncSignSendRawMiddleware(w3, accounts)
+
     return middleware
 
 
-def keccak256(value: Union[str, bytes]) -> str:
+def keccak256(value: str | bytes) -> str:
     """
     Compute Keccak-256 hash of input value.
 
@@ -389,19 +414,20 @@ def keccak256(value: Union[str, bytes]) -> str:
     """
     if isinstance(value, bytes):
         hashed = keccak(value)
-    elif value.startswith('0x'):
+    elif value.startswith("0x"):
         hashed = keccak(hexstr=value)
     else:
         hashed = keccak(text=value)
 
     hex = hashed.hex()
     # Add the '0x' prefix if not present
-    if not hex.startswith('0x'):
-        hex = '0x' + hex
+    if not hex.startswith("0x"):
+        hex = "0x" + hex
     return hex
 
 
 solidity_keccak = Web3.solidity_keccak
+
 
 class AttrDict(dict):
     """

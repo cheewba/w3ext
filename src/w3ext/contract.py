@@ -41,31 +41,35 @@ Dynamic Call/Transact Rules:
 """
 
 import binascii
-from inspect import Signature, Parameter, BoundArguments
-from typing import Any, Optional, Tuple, TYPE_CHECKING, List, Union
+from inspect import BoundArguments, Parameter, Signature
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 
-from web3.contract.async_contract import AsyncContract, AsyncContractFunction
+from eth_abi.abi import encode as encode_abi
 from eth_typing import HexStr
-from eth_abi import encode as encode_abi
+from web3.contract.async_contract import AsyncContract, AsyncContractFunction
+from web3.types import TxParams
 
-from .utils import fill_nonce, fill_gas_price, fill_chain_id, to_checksum_address
 from .batch import to_batch_aware_method
+from .utils import fill_chain_id, fill_gas_price, fill_nonce, to_checksum_address
 
 if TYPE_CHECKING:
-    from .chain import Chain
     from .account import Account
+    from .chain import Chain
 
 __all__ = ["Contract"]
 
-FunctionSignature = Tuple[List[str], str]
+FunctionSignature = tuple[list[str], str]
 
 
-_overloadedTransactSig = Signature([
-    Parameter('account', Parameter.POSITIONAL_OR_KEYWORD),
-    Parameter('transaction', Parameter.POSITIONAL_OR_KEYWORD, default=None),
-])
+_overloadedTransactSig = Signature(
+    [
+        Parameter("account", Parameter.POSITIONAL_OR_KEYWORD),
+        Parameter("transaction", Parameter.POSITIONAL_OR_KEYWORD, default=None),
+    ]
+)
 
-def signatureMatch(sig, *args, **kwargs) -> Tuple[bool, Optional[BoundArguments]]:
+
+def signatureMatch(sig, *args, **kwargs) -> tuple[bool, BoundArguments | None]:
     """
     Check if function arguments match the transaction signature pattern.
 
@@ -88,7 +92,7 @@ def signatureMatch(sig, *args, **kwargs) -> Tuple[bool, Optional[BoundArguments]
     """
     try:
         # if arguments bound
-        return True, _overloadedTransactSig.bind(*args, **kwargs)
+        return True, sig.bind(*args, **kwargs)
     except TypeError:
         return False, None
 
@@ -126,6 +130,9 @@ class NotBoundContractFunction:
         self.name = name
         self.chain = chain
         self.address = contract_address
+
+    def __call__(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise TypeError(f"Provide an ABI signature for {self.name} before calling it")
 
     def _get_abi(self, signature: FunctionSignature):
         """
@@ -166,8 +173,7 @@ class NotBoundContractFunction:
             sig_input = signature[0]
             sig_output = signature[1] if len(signature) > 1 else []
 
-        inputs = [{"name": f"arg{i}", "type": item}
-                  for i, item in enumerate(sig_input)]
+        inputs = [{"name": f"arg{i}", "type": item} for i, item in enumerate(sig_input)]
 
         output = [sig_output] if isinstance(sig_output, str) else sig_output
         outputs = [{"name": "", "type": item} for item in output]
@@ -177,7 +183,7 @@ class NotBoundContractFunction:
             "name": self.name,
             "inputs": inputs,
             "outputs": outputs,
-            "stateMutability": "payable"
+            "stateMutability": "payable",
         }
 
     def __getitem__(self, signature: FunctionSignature):
@@ -200,9 +206,12 @@ class NotBoundContractFunction:
             >>> tx_hash = await transfer_fn(to, amount).transact(account)
         """
         fn = AsyncContractFunction.factory(
-            self.name, w3=self.chain, address=self.address,
-            abi=(abi:=self._get_abi(signature)), fn_name=self.name,
-            contract_abi=[abi]
+            self.name,
+            w3=self.chain,
+            address=self.address,
+            abi=(abi := self._get_abi(signature)),
+            fn_name=self.name,
+            contract_abi=[abi],
         )
         return ContractFunction(fn, self.chain)
 
@@ -239,7 +248,7 @@ class ContractFunction:
         # Underlying AsyncContractFunction
         self.__function: AsyncContractFunction = function
         # Chain instance for blockchain operations
-        self._chain: "Chain" = chain
+        self._chain: Chain = chain
 
     @property
     def chain(self) -> "Chain":
@@ -296,6 +305,8 @@ class ContractFunction:
             ... )
         """
         tx, account = await self._build_transaction(*args, **kwargs)
+        if account is None:
+            raise TypeError("transact requires an account")
         return await self._chain.eth.send_raw_transaction(
             account.sign_transaction(tx).raw_transaction
         )
@@ -311,13 +322,13 @@ class ContractFunction:
             Tuple of (transaction_dict, account_or_none)
         """
         match, bound = signatureMatch(_overloadedTransactSig, *args, **kwargs)
-        if not match:
+        if not match or bound is None:
             return await self.__function.build_transaction(*args, **kwargs), None
 
         kwargs = dict(bound.arguments)
-        account: Account = kwargs.pop('account')
-        tx = kwargs.setdefault('transaction', {}) or {}
-        tx['from'] = account.address
+        account: Account = kwargs.pop("account")
+        tx = cast(TxParams, kwargs.get("transaction") or {})
+        tx["from"] = account.address
         tx = await fill_chain_id(self._chain, tx)
         tx = await fill_nonce(self._chain, tx)
         tx = await fill_gas_price(self._chain, tx)
@@ -352,7 +363,9 @@ class ContractFunction:
             ...     block_identifier='latest'
             ... )
         """
-        return await to_batch_aware_method(self._chain, self.__function.call)(*args, **kwargs)
+        return await to_batch_aware_method(self._chain, self.__function.call)(
+            *args, **kwargs
+        )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """
@@ -390,7 +403,7 @@ class ContractFunctions:
         >>> result = await typed_fn(123).call()
     """
 
-    def __init__(self, contract: Union[AsyncContract, str], chain: "Chain") -> None:
+    def __init__(self, contract: AsyncContract | str, chain: "Chain") -> None:
         """
         Initialize contract functions accessor.
 
@@ -399,11 +412,13 @@ class ContractFunctions:
             chain: Chain instance for blockchain operations
         """
         # Contract instance or address
-        self.__contract: Union[AsyncContract, str] = contract
+        self.__contract: AsyncContract | str = contract
         # Chain instance for blockchain operations
-        self._chain: "Chain" = chain
+        self._chain: Chain = chain
 
-    def __getattr__(self, function_name: str) -> "ContractFunction":
+    def __getattr__(
+        self, function_name: str
+    ) -> "ContractFunction | NotBoundContractFunction":
         """
         Get a contract function by name.
 
@@ -428,10 +443,16 @@ class ContractFunctions:
         if isinstance(addr, AsyncContract):
             addr = addr.address
 
-        try:
-            return ContractFunction(getattr(self.__contract.functions, function_name), self._chain)
-        except AttributeError:
-            return NotBoundContractFunction(function_name, addr, self._chain)
+        if isinstance(self.__contract, AsyncContract):
+            try:
+                return ContractFunction(
+                    getattr(self.__contract.functions, function_name), self._chain
+                )
+            except AttributeError:
+                pass
+        if addr is None:
+            raise ValueError("Contract address is required")
+        return NotBoundContractFunction(function_name, addr, self._chain)
 
 
 class Contract:
@@ -460,9 +481,7 @@ class Contract:
         >>> packed = Contract.pack(['uint256', 'address'], 123, "0x123...")
     """
 
-    def __init__(self,
-                 contract: Union[AsyncContract, str],
-                 chain: "Chain") -> None:
+    def __init__(self, contract: AsyncContract | str, chain: "Chain") -> None:
         """
         Initialize contract wrapper.
 
@@ -471,9 +490,9 @@ class Contract:
             chain: Chain instance for blockchain operations
         """
         # Underlying AsyncContract or contract address
-        self.__contract: Union[AsyncContract, str] = contract
+        self.__contract: AsyncContract | str = contract
         # Chain instance for blockchain operations
-        self.__chain: "Chain" = chain
+        self.__chain: Chain = chain
         # ContractFunctions accessor for function calls
         self.functions: ContractFunctions = ContractFunctions(contract, chain)
 
@@ -485,8 +504,11 @@ class Contract:
     @property
     def address(self) -> str:
         """Get the contract's checksummed address."""
-        return (self.__contract.address if isinstance(self.__contract, AsyncContract)
-                else to_checksum_address(self.__contract))
+        return (
+            self.__contract.address
+            if isinstance(self.__contract, AsyncContract)
+            else to_checksum_address(self.__contract)
+        )
 
     def __getattr__(self, name) -> Any:
         """
@@ -501,7 +523,7 @@ class Contract:
         super().__getattribute__(name)
 
     @classmethod
-    def encode(cls, types: List[str], *values: List[Any]) -> HexStr:
+    def encode(cls, types: list[str], *values: list[Any]) -> HexStr:
         """
         Encode values using standard Ethereum ABI encoding.
 
@@ -527,7 +549,7 @@ class Contract:
             >>> # Use in transaction data
             >>> tx = {'to': contract_address, 'data': encoded}
         """
-        return f"0x{encode_abi(types, values).hex()}"
+        return HexStr(f"0x{encode_abi(types, values).hex()}")
 
     @classmethod
     def _single_pack(cls, type_str, value):
@@ -544,20 +566,20 @@ class Contract:
         Returns:
             Encoded bytes for the value
         """
-        if type_str.startswith('uint') or type_str.startswith('int'):
+        if type_str.startswith(("uint", "int")):
             # Determine the size of the integer based on its type
             size = int(type_str[4:]) if type_str[4:] else 256
             byte_size = (size + 7) // 8  # Convert bit size to byte size
             return encode_abi([type_str], [value])[-byte_size:]
-        elif type_str == 'address':
+        elif type_str == "address":
             # Address: decode hex, ensure it's 20 bytes
-            return binascii.unhexlify(value[2:].rjust(40, '0'))
+            return binascii.unhexlify(value[2:].rjust(40, "0"))
 
         # Fallback for other types
         return encode_abi([type_str], [value])
 
     @classmethod
-    def pack(cls, types: List[str], *values: List[Any]) -> HexStr:
+    def pack(cls, types: list[str], *values: list[Any]) -> HexStr:
         """
         Pack values into a single hex string with minimal padding.
 
@@ -596,7 +618,7 @@ class Contract:
             raise ValueError("Types and values lists must have the same length.")
 
         # Encode and concatenate values
-        encoded_bytes = b''.join(cls._single_pack(t, v) for t, v in zip(types, values))
+        encoded_bytes = b"".join(cls._single_pack(t, v) for t, v in zip(types, values))
 
         # Convert to hex string
-        return f"0x{encoded_bytes.hex()}"
+        return HexStr(f"0x{encoded_bytes.hex()}")

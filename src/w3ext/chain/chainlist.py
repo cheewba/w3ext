@@ -20,34 +20,37 @@ Notes:
 - Only HTTP(S) endpoints are used for RPC resolution (ws/wss are skipped).
 - A default timeout of 30 seconds is applied to the underlying AsyncHTTPProvider unless overridden.
 """
+
 import asyncio
 import time
-from typing import Any, Dict, List, Optional, Union, Set, Callable, Awaitable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import aiohttp
 from web3 import AsyncHTTPProvider
 
 from ..exceptions import ChainException
 
-
 CHAINLIST_RPCS_URL = "https://chainlist.org/rpcs.json"
 
 
 class ChainlistClient:
     def __init__(self) -> None:
-        self._data: Optional[List[Dict[str, Any]]] = None
+        self._data: list[dict[str, Any]] | None = None
         # In-memory cache for Chainlist data; stales after 60 seconds
         self._expires_at: float = 0.0
         self._lock: asyncio.Lock = asyncio.Lock()
 
-    async def _fetch_data(self) -> List[Dict[str, Any]]:
+    async def _fetch_data(self) -> list[dict[str, Any]]:
         timeout = aiohttp.ClientTimeout(total=60)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(CHAINLIST_RPCS_URL) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.get(CHAINLIST_RPCS_URL) as resp,
+        ):
+            resp.raise_for_status()
+            return await resp.json()
 
-    async def get_data(self) -> List[Dict[str, Any]]:
+    async def get_data(self) -> list[dict[str, Any]]:
         now = time.monotonic()
         if self._data is None or now >= self._expires_at:
             async with self._lock:
@@ -56,7 +59,7 @@ class ChainlistClient:
                     self._expires_at = time.monotonic() + 60.0  # 60s TTL
         return self._data
 
-    async def _get_first_http_rpc(self, chain_id: Union[int, str]) -> Optional[str]:
+    async def _get_first_http_rpc(self, chain_id: int | str) -> str | None:
         # Returns first HTTP(S) RPC for given chain_id
         cid = int(chain_id)
         data = await self.get_data()
@@ -68,27 +71,27 @@ class ChainlistClient:
                 url = rpc_entry if isinstance(rpc_entry, str) else rpc_entry.get("url")
                 if not isinstance(url, str):
                     continue
-                if url.startswith("http://") or url.startswith("https://"):
+                if url.startswith(("http://", "https://")):
                     return url
             return None
         return None
 
-    async def _get_http_rpcs(self, chain_id: Union[int, str]) -> List[str]:
+    async def _get_http_rpcs(self, chain_id: int | str) -> list[str]:
         # Collects all HTTP(S) RPC endpoints for the given chain_id in Chainlist order
         cid = int(chain_id)
-        urls: List[str] = []
+        urls: list[str] = []
         data = await self.get_data()
         for item in data:
             if int(item.get("chainId", -1)) != cid:
                 continue
             for rpc_entry in item.get("rpc", []):
                 url = rpc_entry if isinstance(rpc_entry, str) else rpc_entry.get("url")
-                if isinstance(url, str) and (url.startswith("http://") or url.startswith("https://")):
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
                     urls.append(url)
             break
         return urls
 
-    async def _get_eip3091_explorer_base(self, chain_id: Union[int, str]) -> Optional[str]:
+    async def _get_eip3091_explorer_base(self, chain_id: int | str) -> str | None:
         cid = int(chain_id)
         data = await self.get_data()
         for item in data:
@@ -104,12 +107,12 @@ class ChainlistClient:
 
     def get_chain_provider(
         self,
-        chain_id: Union[int, str],
-        request_kwargs: Optional[Dict[str, Any]] = None,
+        chain_id: int | str,
+        request_kwargs: dict[str, Any] | None = None,
     ) -> "ChainlistAsyncHTTPProvider":
         return ChainlistAsyncHTTPProvider(self, chain_id, request_kwargs)
 
-    async def get_chain_explorer(self, chain_id: Union[int, str]) -> Optional[str]:
+    async def get_chain_explorer(self, chain_id: int | str) -> str | None:
         return await self._get_eip3091_explorer_base(chain_id)
 
 
@@ -124,8 +127,8 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
     def __init__(
         self,
         client: ChainlistClient,
-        chain_id: Union[int, str],
-        request_kwargs: Optional[Dict[str, Any]] = None,
+        chain_id: int | str,
+        request_kwargs: dict[str, Any] | None = None,
     ) -> None:
         # Store resolution context; endpoint is chosen per-request
         self._client = client
@@ -133,7 +136,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
         self._request_kwargs = dict(request_kwargs or {})
         self._ensure_lock = asyncio.Lock()
         self._resolved = False
-        self._current_rpc: Optional[str] = None
+        self._current_rpc: str | None = None
         # Default timeout unless overridden
         self._request_kwargs.setdefault("timeout", 30)
         # Initialize parent with placeholder; will switch before each request attempt
@@ -156,7 +159,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
                 return
             self._resolved = True
 
-    async def _pick_rpc(self, failed: Set[str]) -> Optional[str]:
+    async def _pick_rpc(self, failed: set[str]) -> str | None:
         # Picks an HTTP(S) RPC not in the failed set; resets when all exhausted
         urls = await self._client._get_http_rpcs(self._chain_id)
         if not urls:
@@ -174,8 +177,8 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
         max_attempts: int = 3,
     ) -> Any:
         # Tries up to max_attempts, rotating RPC endpoint only on errors/exceptions
-        failed: Set[str] = set()
-        last_exc: Optional[BaseException] = None
+        failed: set[str] = set()
+        last_exc: BaseException | None = None
         last_resp: Any = None
         for attempt in range(max_attempts):
             if attempt == 0 and self._current_rpc and self._current_rpc not in failed:
@@ -196,7 +199,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
                 # success path: stick to this rpc for subsequent calls
                 self._current_rpc = rpc
                 return resp
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - retry after any RPC failure
                 last_exc = exc
                 failed.add(rpc)
                 if rpc == self._current_rpc:
@@ -206,7 +209,9 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
             raise last_exc
         if last_resp is not None:
             return last_resp
-        raise ChainException(f"No HTTP RPC found on Chainlist for chain_id={self._chain_id}")
+        raise ChainException(
+            f"No HTTP RPC found on Chainlist for chain_id={self._chain_id}"
+        )
 
     async def make_request(self, method: str, params: Any) -> Any:
         await self._ensure_endpoint()
@@ -215,7 +220,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
             return isinstance(resp, dict) and "error" in resp
 
         # Capture base method here to avoid zero-arg super() inside lambda
-        base_make_request = super(ChainlistAsyncHTTPProvider, self).make_request
+        base_make_request = super().make_request
 
         return await self._perform_with_rotation(
             lambda: base_make_request(method, params),
@@ -234,7 +239,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
             return False
 
         # Capture base method here to avoid zero-arg super() inside lambda
-        base_make_batch = super(ChainlistAsyncHTTPProvider, self).make_batch_request
+        base_make_batch = super().make_batch_request
 
         return await self._perform_with_rotation(
             lambda: base_make_batch(batch_requests),
@@ -243,25 +248,24 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
         )
 
 
-
 # Module-level singleton client instance and exported helpers
 _client = ChainlistClient()
 
 
 def get_chain_provider(
-    chain_id: Union[int, str],
-    request_kwargs: Optional[Dict[str, Any]] = None,
+    chain_id: int | str,
+    request_kwargs: dict[str, Any] | None = None,
 ) -> ChainlistAsyncHTTPProvider:
     return _client.get_chain_provider(chain_id, request_kwargs)
 
 
-async def get_chain_explorer(chain_id: Union[int, str]) -> Optional[str]:
+async def get_chain_explorer(chain_id: int | str) -> str | None:
     return await _client.get_chain_explorer(chain_id)
 
 
 __all__ = [
-    "ChainlistClient",
     "ChainlistAsyncHTTPProvider",
-    "get_chain_provider",
+    "ChainlistClient",
     "get_chain_explorer",
+    "get_chain_provider",
 ]
