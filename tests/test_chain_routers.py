@@ -455,6 +455,49 @@ def test_retained_subscription_manager_uses_its_provider_in_child_task():
     asyncio.run(check())
 
 
+def test_retained_socket_uses_its_original_provider():
+    chain = Chain(1)
+    first = WebSocketProvider("ws://localhost:12345")
+    second = WebSocketProvider("ws://localhost:12346")
+    seen = []
+
+    async def send(method, params):
+        seen.append(("send", chain._web3.provider))
+
+    async def recv():
+        seen.append(("recv", chain._web3.provider))
+        return {"result": "0x1"}
+
+    async def next_message():
+        seen.append(("subscription", chain._web3.provider))
+        return {"result": "0x2"}
+
+    async def make_request(method, params):
+        seen.append(("request", chain._web3.provider))
+        return {"result": "0x3"}
+
+    async def check():
+        with chain_providers_router(StubRouter(first)):
+            socket = chain._web3.socket
+        chain._web3.manager.send = send
+        chain._web3.manager.recv = recv
+        chain._web3.manager._get_next_message = next_message
+        first.make_request = make_request
+
+        with chain_providers_router(StubRouter(second), force=True):
+            assert socket.provider is first
+            await socket.send(RPCEndpoint("eth_blockNumber"), [])
+            assert await socket.recv() == {"result": "0x1"}
+            assert await socket.make_request(RPCEndpoint("eth_blockNumber"), []) == {
+                "result": "0x3"
+            }
+            assert await anext(socket.process_subscriptions()) == {"result": "0x2"}
+        await socket.send(RPCEndpoint("eth_blockNumber"), [])
+        assert [provider for _, provider in seen] == [first] * 5
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize(
     ("provider_class", "endpoint"),
     [
@@ -505,6 +548,30 @@ def test_persistent_batch_applies_poa_response_middleware():
                 result = await chain.eth.get_block(1)
         assert result["proofOfAuthorityData"] == HexBytes(extra_data)
         assert "extraData" not in result
+
+    asyncio.run(check())
+
+
+def test_shared_persistent_provider_formats_batches_for_each_chain():
+    first = Chain(1)
+    second = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    extra_data = "0x" + "ab" * 33
+    block = {"number": "0x1", "extraData": extra_data, "transactions": []}
+    provider.make_batch_request = AsyncMock(
+        return_value=[{"jsonrpc": "2.0", "id": 0, "result": block}]
+    )
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with first.use_batch(max_size=1), second.use_batch(max_size=1):
+                results = await asyncio.gather(
+                    first.eth.get_block(1), second.eth.get_block(1)
+                )
+        assert [item["proofOfAuthorityData"] for item in results] == [
+            HexBytes(extra_data),
+            HexBytes(extra_data),
+        ]
 
     asyncio.run(check())
 
@@ -697,6 +764,35 @@ def test_context_response_middleware_uses_actual_http_batch_response():
     asyncio.run(check())
 
 
+def test_context_batch_middleware_releases_semaphore_between_wire_batches():
+    chain = Chain(1)
+    provider = StubProvider(7)
+    semaphore = asyncio.Semaphore(1)
+    address = "0x0000000000000000000000000000000000000001"
+
+    def limit(make_request, _w3):
+        async def middleware(method, params):
+            async with semaphore:
+                return await make_request(method, params)
+
+        return middleware
+
+    async def check():
+        await chain.connect_rpc(provider)
+        async with chain.use_middlewares(limit):
+            async with chain.use_batch(max_size=2):
+                balances = await asyncio.wait_for(
+                    asyncio.gather(
+                        chain.eth.get_balance(address), chain.eth.get_balance(address)
+                    ),
+                    2,
+                )
+        assert balances == [7, 7]
+        assert [len(batch) for batch in provider.batches] == [1, 1]
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("persistent", [False, True])
 def test_context_middleware_can_short_circuit_batch_requests(persistent):
     chain = Chain(1)
@@ -776,6 +872,87 @@ def test_context_middleware_can_short_circuit_persistent_single_request():
                 block = await chain.eth.get_block(1)
                 assert block["proofOfAuthorityData"] == HexBytes(extra_data)
         provider.send_request.assert_not_awaited()
+
+    asyncio.run(check())
+
+
+def test_persistent_context_middleware_resumes_with_response_and_can_retry():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    sent = []
+    events = []
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def send_request(method, params):
+        request = provider.form_request(method, params)
+        sent.append(request)
+        events.append("send")
+        return request
+
+    async def recv_for_request(request):
+        return {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": "0x0" if len(sent) == 1 else "0x7",
+        }
+
+    provider.send_request = send_request
+    provider.recv_for_request = recv_for_request
+
+    def retry_and_increment(make_request, _w3):
+        async def middleware(method, params):
+            try:
+                response = await make_request(method, params)
+                if response["result"] == "0x0":
+                    response = await make_request(method, params)
+                events.append("response")
+                return {
+                    **response,
+                    "result": hex(int(response["result"], 16) + 1),
+                }
+            finally:
+                events.append("finally")
+
+        return middleware
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_middlewares(retry_and_increment):
+                assert await chain.eth.get_balance(address) == 8
+        assert len(sent) == 2
+        assert events == ["send", "send", "response", "finally"]
+
+    asyncio.run(check())
+
+
+def test_cached_persistent_batch_block_runs_poa_middleware():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    provider.make_batch_request = AsyncMock(side_effect=AssertionError("RPC was sent"))
+    extra_data = "0x" + "ab" * 33
+
+    def cache(make_request, _w3):
+        async def middleware(method, params):
+            assert method == "eth_getBlockByNumber"
+            return {
+                "jsonrpc": "2.0",
+                "id": 99,
+                "result": {
+                    "number": "0x1",
+                    "extraData": extra_data,
+                    "transactions": [],
+                },
+            }
+
+        return middleware
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_middlewares(cache):
+                async with chain.use_batch(max_size=1):
+                    block = await chain.eth.get_block(1)
+        assert block["proofOfAuthorityData"] == HexBytes(extra_data)
+        provider.make_batch_request.assert_not_awaited()
 
     asyncio.run(check())
 

@@ -21,6 +21,7 @@ from web3 import AsyncHTTPProvider
 from web3 import AsyncWeb3 as _AsyncWeb3
 from web3.eth import AsyncEth
 from web3.exceptions import Web3ValidationError
+from web3.manager import _AsyncPersistentMessageStream
 from web3.middleware import (
     AttributeDictMiddleware,
     BufferedGasEstimateMiddleware,
@@ -55,6 +56,9 @@ _batcher_ctx_var: ContextVar[dict[int, Batch] | None] = ContextVar(
 )
 _accounts_ctx_var: ContextVar[dict[int, dict[ChecksumAddress, LocalAccount]] | None] = (
     ContextVar("_accounts_ctx_var", default=None)
+)
+_active_chain_ctx_var: ContextVar["Chain | None"] = ContextVar(
+    "_active_chain_ctx_var", default=None
 )
 
 
@@ -99,11 +103,8 @@ class AsyncEthProxy:
         super().__setattr__(name, value)
 
 
-def patch_provider(provider_instance, chain):
-    """
-    Dynamically creates a subclass of the provider's class that adds a property
-    _is_batching, then changes the instance's __class__ to that subclass.
-    """
+def patch_provider(provider_instance):
+    """Expose the current task's Chain state through a shared provider."""
     # Save the original class
     orig_cls = provider_instance.__class__
 
@@ -111,7 +112,8 @@ def patch_provider(provider_instance, chain):
     class PatchedProvider(orig_cls):
         @property
         def _is_batching(self):
-            return chain._is_batching
+            chain = _active_chain_ctx_var.get()
+            return chain._is_batching if chain is not None else False
 
         @_is_batching.setter
         def _is_batching(self, value):
@@ -120,9 +122,10 @@ def patch_provider(provider_instance, chain):
 
         @property
         def has_persistent_connection(self):
-            return (
-                orig_cls.has_persistent_connection
-                and not chain._routing_provider._processing_responses_directly.get()
+            chain = _active_chain_ctx_var.get()
+            return orig_cls.has_persistent_connection and not (
+                chain is not None
+                and chain._routing_provider._processing_responses_directly.get()
             )
 
     # Change the instance's class to the new patched subclass.
@@ -149,6 +152,47 @@ class RoutedSubscriptionManager(SubscriptionManager):
     async def handle_subscriptions(self, run_forever: bool = False) -> None:
         with self._routing_provider.use_provider(self._provider):
             await super().handle_subscriptions(run_forever)
+
+
+class RoutedPersistentMessageStream(_AsyncPersistentMessageStream):
+    def __init__(self, manager, provider, routing_provider):
+        self._bound_provider = provider
+        self._routing_provider = routing_provider
+        with routing_provider.use_provider(provider):
+            super().__init__(manager)
+
+    async def __anext__(self):
+        with self._routing_provider.use_provider(self._bound_provider):
+            return await super().__anext__()
+
+
+class RoutedPersistentConnection(PersistentConnection):
+    def __init__(self, w3, provider, routing_provider):
+        self._routing_provider = routing_provider
+        with routing_provider.use_provider(provider):
+            super().__init__(w3)
+
+    @property
+    def subscriptions(self):
+        with self._routing_provider.use_provider(self.provider):
+            return super().subscriptions
+
+    async def make_request(self, method, params):
+        with self._routing_provider.use_provider(self.provider):
+            return await super().make_request(method, params)
+
+    async def send(self, method, params):
+        with self._routing_provider.use_provider(self.provider):
+            return await super().send(method, params)
+
+    async def recv(self):
+        with self._routing_provider.use_provider(self.provider):
+            return await super().recv()
+
+    def process_subscriptions(self):
+        return RoutedPersistentMessageStream(
+            self._manager, self.provider, self._routing_provider
+        )
 
 
 class AsyncWeb3(_AsyncWeb3):
@@ -193,14 +237,21 @@ class AsyncWeb3(_AsyncWeb3):
         provider = self._selected_persistent_provider()
         entry = self._persistent_connections.get(id(provider))
         if entry is None or entry[0] is not provider:
-            entry = (provider, PersistentConnection(self))
+            entry = (
+                provider,
+                RoutedPersistentConnection(
+                    self, provider, self._chain._routing_provider
+                ),
+            )
             self._persistent_connections[id(provider)] = entry
         return entry[1]
 
     def __getattribute__(self, name: str) -> Any:
         value = super().__getattribute__(name)
-        if name == "provider" and value.__class__.__name__ != "PatchedProvider":
-            value = patch_provider(value, self._chain)
+        if name == "provider":
+            _active_chain_ctx_var.set(self._chain)
+            if value.__class__.__name__ != "PatchedProvider":
+                value = patch_provider(value)
         return value
 
 

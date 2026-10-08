@@ -6,8 +6,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
+from web3._utils.caching.caching_utils import generate_cache_key
 from web3._utils.validation import raise_error_for_batch_response
 from web3.manager import RequestManager
 from web3.providers import AsyncBaseProvider
@@ -17,7 +18,7 @@ from web3.types import RPCEndpoint
 
 from ..exceptions import ChainException
 from .chainlist import get_chain_provider
-from .middlewares import _ShortCircuitResponse
+from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
 
 
 class ChainProviderRouter(Protocol):
@@ -92,6 +93,9 @@ class RoutingProvider(AsyncJSONBaseProvider):
         self._processing_responses_directly: ContextVar[bool] = ContextVar(
             f"chain_processing_responses_directly_{id(self)}", default=False
         )
+        self._bypass_context_request_processor: ContextVar[bool] = ContextVar(
+            f"chain_bypass_context_request_processor_{id(self)}", default=False
+        )
 
     @contextmanager
     def use_provider(self, provider: AsyncBaseProvider) -> Iterator[None]:
@@ -128,6 +132,15 @@ class RoutingProvider(AsyncJSONBaseProvider):
             yield
         finally:
             self._processing_responses_directly.reset(token)
+
+    @contextmanager
+    def bypass_context_request_processor(self) -> Iterator[None]:
+        """Avoid wrapping a request twice when the manager runs its full handler."""
+        token = self._bypass_context_request_processor.set(True)
+        try:
+            yield
+        finally:
+            self._bypass_context_request_processor.reset(token)
 
     def _selected_provider(self) -> AsyncBaseProvider | None:
         override = self._provider_override.get()
@@ -239,21 +252,84 @@ class RoutingRequestManager(RequestManager):
             raise ChainException("A persistent RPC provider is not selected")
         return provider._request_processor
 
-    async def socket_request(self, method, params, response_formatters=None):
-        try:
+    async def socket_request(self, method, params, response_formatters=None) -> Any:
+        chain = cast(Any, self.w3)._chain
+        active = (_middlewares_ctx_var.get() or {}).get(id(chain))
+        if not active:
             return await super().socket_request(method, params, response_formatters)
-        except _ShortCircuitResponse as short_circuit:
-            response = short_circuit.response
+
+        provider = self._provider
+        if not isinstance(provider, PersistentConnectionProvider):
+            return await super().socket_request(method, params, response_formatters)
+        formatters = cast(Any, response_formatters or ((), (), ()))
+        sent_ids = []
+
+        async def make_request(next_method, next_params):
+            with (
+                self._routing_provider.use_provider(provider),
+                self._routing_provider.bypass_context_request_processor(),
+                self._routing_provider.process_responses_directly(),
+            ):
+                rpc_request = await self.send(next_method, next_params)
+                request_id = rpc_request.get("id")
+                if request_id is None:
+                    raise ChainException("Persistent RPC request has no ID")
+                provider._request_processor.cache_request_information(
+                    request_id,
+                    rpc_request.get("method", next_method),
+                    rpc_request.get("params", next_params),
+                    formatters,
+                )
+                try:
+                    recv_func = await provider.recv_func(
+                        cast(Any, self.w3), cast(Any, self.middleware_onion)
+                    )
+                    response = await recv_func(rpc_request)
+                except BaseException:
+                    provider._request_processor.pop_cached_request_information(
+                        generate_cache_key(request_id)
+                    )
+                    raise
+                sent_ids.append(request_id)
+                return response
+
+        dynamic = DynamicContextMiddleware(self.w3, chain)
+        handler = await dynamic._wrap_active_middlewares(make_request)
+        with self._routing_provider.use_provider(provider):
+            try:
+                response = await handler(method, params)
+            except BaseException:
+                for request_id in sent_ids:
+                    provider._request_processor.pop_cached_request_information(
+                        generate_cache_key(request_id)
+                    )
+                raise
+
+            final_id = response.get("id")
+            for request_id in sent_ids:
+                if request_id != final_id:
+                    provider._request_processor.pop_cached_request_information(
+                        generate_cache_key(request_id)
+                    )
+            if final_id in sent_ids:
+                return await self._process_response(response)
             with self._routing_provider.process_responses_directly():
-                for middleware in reversed(
-                    self.middleware_onion.as_tuple_of_middleware()
-                ):
-                    response = await middleware(self.w3).async_response_processor(
+                middleware_stack = self.middleware_onion.as_tuple_of_middleware()
+                position = next(
+                    (
+                        index
+                        for index, item in enumerate(middleware_stack)
+                        if isinstance(item, type)
+                        and issubclass(item, DynamicContextMiddleware)
+                    ),
+                    len(middleware_stack),
+                )
+                for item in reversed(middleware_stack[position + 1 :]):
+                    response = await cast(Any, item)(self.w3).async_response_processor(
                         method, response
                     )
             return self._format_batched_response(
-                ((method, params), response_formatters or ((), (), ())),
-                response,
+                ((method, params), formatters), response
             )
 
     async def _async_make_batch_request(self, requests_info):
@@ -267,7 +343,9 @@ class RoutingRequestManager(RequestManager):
         # Web3 normally looks up persistent batch formatters by a predicted RPC ID.
         # Middleware can issue an RPC before the batch is encoded, consuming that ID.
         # Keep each formatter with its original request and format the returned list.
-        request_func = await provider.batch_request_func(self.w3, self.middleware_onion)
+        request_func = await provider.batch_request_func(
+            cast(Any, self.w3), cast(Any, self.middleware_onion)
+        )
         unpacked = await asyncio.gather(*requests_info)
         with self._routing_provider.process_responses_directly():
             response = await request_func(
