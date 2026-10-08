@@ -433,6 +433,104 @@ def test_persistent_batch_initializes_request_ids_before_caching(
     asyncio.run(check())
 
 
+def test_persistent_batch_chunks_do_not_overlap():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    active = 0
+    maximum_active = 0
+    batches = []
+
+    async def make_batch_request(requests):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        batches.append(requests)
+        try:
+            if len(batches) == 1:
+                await asyncio.sleep(0.05)
+            return [
+                {"jsonrpc": "2.0", "id": index, "result": hex(int(params[0], 16))}
+                for index, (_, params) in enumerate(requests)
+            ]
+        finally:
+            active -= 1
+
+    provider.make_batch_request = make_batch_request
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_batch(max_size=2):
+                balances = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            chain.eth.get_balance(f"0x{index:040x}")
+                            for index in range(1, 5)
+                        )
+                    ),
+                    2,
+                )
+        assert balances == [1, 2, 3, 4]
+        assert len(batches) == 2
+        assert maximum_active == 1
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("flush_on_exit", [False, True])
+def test_batch_validation_middleware_queries_chain_id_outside_collection(
+    flush_on_exit,
+):
+    chain = Chain(1)
+    provider = StubProvider(1)
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def check():
+        await chain.connect_rpc(provider)
+        if flush_on_exit:
+            async with chain.use_batch(max_size=20, max_wait=0) as batcher:
+                call = asyncio.create_task(
+                    chain.eth.call({"to": address, "chainId": 1})
+                )
+                while not batcher._requests:
+                    if call.done():
+                        await call
+                    await asyncio.sleep(0)
+            result = await call
+        else:
+            async with chain.use_batch(max_size=1):
+                result = await chain.eth.call({"to": address, "chainId": 1})
+        assert result == HexBytes("0x01")
+        assert any(method == "eth_chainId" for method, _ in provider.requests)
+
+    asyncio.run(check())
+
+
+def test_context_response_middleware_uses_actual_http_batch_response():
+    chain = Chain(1)
+    provider = StubProvider(7)
+    seen = []
+    address = "0x0000000000000000000000000000000000000001"
+
+    def increment(make_request, _w3):
+        async def middleware(method, params):
+            seen.append("request")
+            response = await make_request(method, params)
+            seen.append("response")
+            return {**response, "result": hex(int(response["result"], 16) + 1)}
+
+        return middleware
+
+    async def check():
+        await chain.connect_rpc(provider)
+        async with chain.use_middlewares(increment):
+            async with chain.use_batch(max_size=1):
+                assert await chain.eth.get_balance(address) == 8
+        assert len(provider.batches) == 1
+        assert seen == ["request", "response"]
+
+    asyncio.run(check())
+
+
 def test_persistent_route_applies_context_request_middleware():
     chain = Chain(1)
     provider = WebSocketProvider("ws://localhost:12345")

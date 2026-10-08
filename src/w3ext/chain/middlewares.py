@@ -1,3 +1,4 @@
+import asyncio
 from contextvars import ContextVar
 from typing import Any
 
@@ -7,6 +8,12 @@ from web3.types import RPCEndpoint
 _middlewares_ctx_var: ContextVar[dict[int, list] | None] = ContextVar(
     "_middlewares_ctx_var", default=None
 )
+
+
+class _ForwardedRequest(BaseException):
+    def __init__(self, method, params):
+        self.method = method
+        self.params = params
 
 
 class DynamicContextMiddleware(Web3Middleware):
@@ -36,18 +43,71 @@ class DynamicContextMiddleware(Web3Middleware):
         self, method: RPCEndpoint, params: Any
     ) -> tuple[RPCEndpoint, Any]:
         # Persistent providers call request processors instead of request wrappers.
-        forwarded = None
-
         async def capture(next_method, next_params):
-            nonlocal forwarded
-            forwarded = (next_method, next_params)
-            return {"jsonrpc": "2.0", "id": 0, "result": None}
+            raise _ForwardedRequest(next_method, next_params)
 
         handler = await self._wrap_active_middlewares(capture)
-        await handler(method, params)
-        if forwarded is None:
-            raise RuntimeError("Context middleware did not forward the RPC request")
-        return forwarded
+        try:
+            await handler(method, params)
+        except _ForwardedRequest as forwarded:
+            return forwarded.method, forwarded.params
+        raise RuntimeError("Context middleware did not forward the RPC request")
+
+    async def async_wrap_make_batch_request(self, make_batch_request):
+        async def middleware(requests):
+            prepared = []
+            running = []
+            try:
+                for method, params in requests:
+                    forwarded = asyncio.get_running_loop().create_future()
+                    response = asyncio.get_running_loop().create_future()
+
+                    async def capture(
+                        next_method,
+                        next_params,
+                        *,
+                        _forwarded=forwarded,
+                        _response=response,
+                    ):
+                        if _forwarded.done():
+                            raise RuntimeError(
+                                "Context middleware forwarded an RPC request twice"
+                            )
+                        _forwarded.set_result((next_method, next_params))
+                        return await _response
+
+                    handler = await self._wrap_active_middlewares(capture)
+                    task = asyncio.create_task(handler(method, params))
+                    running.append(task)
+                    await asyncio.wait(
+                        (forwarded, task), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if not forwarded.done():
+                        await task
+                        raise RuntimeError(
+                            "Context middleware did not forward the RPC request"
+                        )
+                    prepared.append((forwarded.result(), response, task))
+
+                actual_responses = await make_batch_request(
+                    [request for request, _, _ in prepared]
+                )
+                if not isinstance(actual_responses, list):
+                    return actual_responses
+                if len(actual_responses) != len(prepared):
+                    raise RuntimeError("Batch response count does not match requests")
+
+                for (_, response, _), actual in zip(prepared, actual_responses):
+                    response.set_result(actual)
+                return await asyncio.gather(*(task for _, _, task in prepared))
+            finally:
+                pending = [task for task in running if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+        return middleware
 
     async def async_wrap_make_request(self, make_request):
         async def middleware(method, params):

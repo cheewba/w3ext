@@ -84,6 +84,12 @@ class RoutingProvider(AsyncJSONBaseProvider):
         self._collecting_batch_info: ContextVar[bool] = ContextVar(
             f"chain_collecting_batch_info_{id(self)}", default=False
         )
+        self._executing_batch: ContextVar[bool] = ContextVar(
+            f"chain_executing_batch_{id(self)}", default=False
+        )
+        self._preparing_persistent_batch: ContextVar[bool] = ContextVar(
+            f"chain_preparing_persistent_batch_{id(self)}", default=False
+        )
 
     @contextmanager
     def use_provider(self, provider: AsyncBaseProvider) -> Iterator[None]:
@@ -102,6 +108,24 @@ class RoutingProvider(AsyncJSONBaseProvider):
             yield
         finally:
             self._collecting_batch_info.reset(token)
+
+    @contextmanager
+    def execute_batch(self) -> Iterator[None]:
+        """Let middleware's nested RPCs run outside request collection."""
+        token = self._executing_batch.set(True)
+        try:
+            yield
+        finally:
+            self._executing_batch.reset(token)
+
+    @contextmanager
+    def prepare_persistent_batch(self) -> Iterator[None]:
+        """Allow Web3 to cache request information after batch IDs are ready."""
+        token = self._preparing_persistent_batch.set(True)
+        try:
+            yield
+        finally:
+            self._preparing_persistent_batch.reset(token)
 
     def _selected_provider(self) -> AsyncBaseProvider | None:
         override = self._provider_override.get()

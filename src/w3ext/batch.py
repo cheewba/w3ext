@@ -36,6 +36,7 @@ from contextlib import nullcontext
 from contextvars import ContextVar
 from functools import wraps
 from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
 from web3 import AsyncWeb3
 from web3._utils.batching import RPC_METHODS_UNSUPPORTED_DURING_BATCH
@@ -51,6 +52,17 @@ logger = logging.getLogger(__name__)
 
 
 _batch_request_processed = ContextVar[bool]("_batch_request_processed", default=False)
+_persistent_batch_locks: WeakKeyDictionary[
+    PersistentConnectionProvider, asyncio.Lock
+] = WeakKeyDictionary()
+
+
+def _persistent_batch_lock(provider: PersistentConnectionProvider) -> asyncio.Lock:
+    lock = _persistent_batch_locks.get(provider)
+    if lock is None:
+        lock = asyncio.Lock()
+        _persistent_batch_locks[provider] = lock
+    return lock
 
 
 def _dummy_checker(self):
@@ -328,25 +340,44 @@ class Batch:
                 if self._routing_provider is not None and provider is not None
                 else nullcontext()
             )
-            with route:
+            execution = (
+                self._routing_provider.execute_batch()
+                if self._routing_provider is not None
+                else nullcontext()
+            )
+            with route, execution:
                 try:
-                    batcher = self._web3.batch_requests()
-                    batcher._validate_is_batching = _dummy_checker.__get__(
-                        batcher, batcher.__class__
-                    )
+                    async def execute():
+                        batcher = self._web3.batch_requests()
+                        batcher._validate_is_batching = _dummy_checker.__get__(
+                            batcher, batcher.__class__
+                        )
 
-                    for request in requests:
-                        batcher.add(request)
+                        for request in requests:
+                            batcher.add(request)
+
+                        if isinstance(provider, PersistentConnectionProvider):
+                            preparation = (
+                                self._routing_provider.prepare_persistent_batch()
+                                if self._routing_provider is not None
+                                else nullcontext()
+                            )
+                            with preparation:
+                                for request in requests:
+                                    (method, params), formatters = await request
+                                    processor = provider._request_processor
+                                    processor.cache_request_information(
+                                        None, method, params, formatters
+                                    )
+
+                        async with semaphore:
+                            return await batcher.async_execute()
 
                     if isinstance(provider, PersistentConnectionProvider):
-                        for request in requests:
-                            (method, params), formatters = await request
-                            provider._request_processor.cache_request_information(
-                                None, method, params, formatters
-                            )
-
-                    async with semaphore:
-                        responses = await batcher.async_execute()
+                        async with _persistent_batch_lock(provider):
+                            responses = await execute()
+                    else:
+                        responses = await execute()
                 except Exception as e:
                     logger.exception("Batch execution failed")
                     for future in futures:

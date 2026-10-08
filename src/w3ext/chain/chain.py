@@ -111,8 +111,10 @@ def patch_provider(provider_instance, chain):
     class PatchedProvider(orig_cls):
         @property
         def _is_batching(self):
-            # Custom getter: return whether _batcher_ctx_var indicates batching is active.
-            return chain._is_batching
+            return (
+                chain._routing_provider._preparing_persistent_batch.get()
+                or chain._is_batching
+            )
 
         @_is_batching.setter
         def _is_batching(self, value):
@@ -318,6 +320,8 @@ class Chain:
 
     @property
     def batcher(self):
+        if self._routing_provider._executing_batch.get():
+            return None
         store = _batcher_ctx_var.get()
         return store.get(id(self)) if store else None
 
@@ -380,12 +384,12 @@ class Chain:
         store = _batcher_ctx_var.get() or {}
         new_store = dict(store)
         new_store[id(self)] = batcher
-        token = _batcher_ctx_var.set(new_store)
-        try:
-            async with batcher:
+        async with batcher:
+            token = _batcher_ctx_var.set(new_store)
+            try:
                 yield batcher
-        finally:
-            _batcher_ctx_var.reset(token)
+            finally:
+                _batcher_ctx_var.reset(token)
 
     @asynccontextmanager
     async def use_middlewares(self, *middlewares: list):
