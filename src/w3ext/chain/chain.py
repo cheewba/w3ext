@@ -112,6 +112,10 @@ def patch_provider(provider_instance):
     class PatchedProvider(orig_cls):
         @property
         def _is_batching(self):
+            # Web3's listener runs in a different task from the batch caller.
+            listener_task = getattr(self, "_message_listener_task", None)
+            if listener_task is not None and asyncio.current_task() is listener_task:
+                return getattr(self, "_w3ext_wire_batch_active", False)
             chain = _active_chain_ctx_var.get()
             return chain._is_batching if chain is not None else False
 

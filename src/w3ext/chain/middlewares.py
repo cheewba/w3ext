@@ -107,9 +107,16 @@ class DynamicContextMiddleware(Web3Middleware):
                     if not ready:
                         continue
 
-                    actual_responses = await make_batch_request(
-                        [(method, params) for method, params, _ in ready]
-                    )
+                    try:
+                        actual_responses = await make_batch_request(
+                            [(method, params) for method, params, _ in ready]
+                        )
+                    except Exception as error:  # noqa: BLE001 - pass transport errors to handlers
+                        for _, _, response in ready:
+                            if not response.done():
+                                response.set_exception(error)
+                        await asyncio.sleep(0)
+                        continue
                     if not isinstance(actual_responses, list):
                         return actual_responses
                     if len(actual_responses) != len(ready):
@@ -117,7 +124,8 @@ class DynamicContextMiddleware(Web3Middleware):
                             "Batch response count does not match forwarded requests"
                         )
                     for (_, _, response), actual in zip(ready, actual_responses):
-                        response.set_result(actual)
+                        if not response.done():
+                            response.set_result(actual)
                     await asyncio.sleep(0)
 
                 results = list(await asyncio.gather(*running))

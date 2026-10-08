@@ -35,7 +35,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from contextvars import ContextVar
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakKeyDictionary
 
 from web3 import AsyncWeb3
@@ -362,7 +362,11 @@ class Batch:
 
                     if isinstance(provider, PersistentConnectionProvider):
                         async with _persistent_batch_lock(provider):
-                            responses = await execute()
+                            cast(Any, provider)._w3ext_wire_batch_active = True
+                            try:
+                                responses = await execute()
+                            finally:
+                                cast(Any, provider)._w3ext_wire_batch_active = False
                     else:
                         responses = await execute()
                 except Exception as e:

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -1012,5 +1013,170 @@ def test_send_transaction_signs_with_persistent_route(monkeypatch):
             )
         assert sent[-1][0] == "eth_sendRawTransaction"
         assert sent[-1][1][0].startswith("0x")
+
+    asyncio.run(check())
+
+
+def test_subscription_notifications_keep_response_middleware():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    subscription_id = HexStr("0xabc")
+    extra_data = "0x" + "ab" * 33
+
+    async def send_request(method, params):
+        return provider.form_request(method, params)
+
+    async def recv_for_request(request):
+        return {"jsonrpc": "2.0", "id": request["id"], "result": subscription_id}
+
+    def passthrough(make_request, _w3):
+        async def middleware(method, params):
+            return await make_request(method, params)
+
+        return middleware
+
+    provider.send_request = send_request
+    provider.recv_for_request = recv_for_request
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_middlewares(passthrough):
+                assert await chain.eth.subscribe("newHeads") == subscription_id
+            response = await chain._web3.manager._process_response(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "eth_subscription",
+                    "params": {
+                        "subscription": subscription_id,
+                        "result": {
+                            "number": "0x1",
+                            "extraData": extra_data,
+                            "transactions": [],
+                        },
+                    },
+                }
+            )
+            result = response["result"]
+            assert result["proofOfAuthorityData"] == HexBytes(extra_data)
+            assert "extraData" not in result
+            assert result.number == "0x1"
+
+    asyncio.run(check())
+
+
+def test_persistent_batch_listener_keeps_batch_response_intact():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    incoming = asyncio.Queue()
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def socket_send(encoded):
+        requests = json.loads(encoded)
+
+        def reply(request):
+            result = "0x2a" if request["method"] == "eth_getBalance" else "0x1"
+            return {"jsonrpc": "2.0", "id": request["id"], "result": result}
+
+        response = (
+            [reply(item) for item in requests]
+            if isinstance(requests, list)
+            else reply(requests)
+        )
+        await incoming.put(response)
+
+    provider.socket_send = socket_send
+    provider._provider_specific_socket_reader = incoming.get
+
+    async def check():
+        provider._message_listener_task = asyncio.create_task(
+            provider._message_listener()
+        )
+        try:
+            with chain_providers_router(StubRouter(provider)):
+                async with chain.use_batch(max_size=1):
+                    assert (
+                        await asyncio.wait_for(chain.eth.get_balance(address), 2) == 42
+                    )
+                assert await asyncio.wait_for(chain.eth.get_balance(address), 2) == 42
+            assert not provider._message_listener_task.done()
+        finally:
+            provider._message_listener_task.cancel()
+            await asyncio.gather(
+                provider._message_listener_task, return_exceptions=True
+            )
+
+    asyncio.run(check())
+
+
+def test_timed_out_batch_middleware_can_return_fallback():
+    chain = Chain(1)
+    provider = StubProvider(7)
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def slow_batch(requests):
+        await asyncio.sleep(0.02)
+        return [
+            {"jsonrpc": "2.0", "id": index, "result": "0x7"}
+            for index, _ in enumerate(requests)
+        ]
+
+    provider.make_batch_request = slow_batch
+
+    def timeout_fallback(make_request, _w3):
+        async def middleware(method, params):
+            try:
+                return await asyncio.wait_for(make_request(method, params), 0.001)
+            except TimeoutError:
+                return {"jsonrpc": "2.0", "id": 99, "result": "0x9"}
+
+        return middleware
+
+    async def check():
+        await chain.connect_rpc(provider)
+        async with chain.use_middlewares(timeout_fallback):
+            async with chain.use_batch(max_size=2):
+                assert await asyncio.wait_for(
+                    asyncio.gather(
+                        chain.eth.get_balance(address), chain.eth.get_balance(address)
+                    ),
+                    2,
+                ) == [9, 9]
+
+    asyncio.run(check())
+
+
+def test_batch_middleware_can_retry_transport_error():
+    chain = Chain(1)
+    provider = StubProvider(7)
+    address = "0x0000000000000000000000000000000000000001"
+    attempts = 0
+
+    async def flaky_batch(requests):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("temporary transport failure")
+        return [
+            {"jsonrpc": "2.0", "id": index, "result": "0x7"}
+            for index, _ in enumerate(requests)
+        ]
+
+    provider.make_batch_request = flaky_batch
+
+    def retry(make_request, _w3):
+        async def middleware(method, params):
+            try:
+                return await make_request(method, params)
+            except OSError:
+                return await make_request(method, params)
+
+        return middleware
+
+    async def check():
+        await chain.connect_rpc(provider)
+        async with chain.use_middlewares(retry):
+            async with chain.use_batch(max_size=1):
+                assert await asyncio.wait_for(chain.eth.get_balance(address), 2) == 7
+        assert attempts == 2
 
     asyncio.run(check())

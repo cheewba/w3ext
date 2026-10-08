@@ -3,7 +3,7 @@
 import asyncio
 import weakref
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -265,18 +265,27 @@ class RoutingRequestManager(RequestManager):
         sent_ids = []
 
         async def make_request(next_method, next_params):
+            # Subscription replies must register Web3's deferred middleware
+            # processors for the notifications that follow the initial reply.
+            response_mode = (
+                nullcontext()
+                if next_method == "eth_subscribe"
+                else self._routing_provider.process_responses_directly()
+            )
             with (
                 self._routing_provider.use_provider(provider),
                 self._routing_provider.bypass_context_request_processor(),
-                self._routing_provider.process_responses_directly(),
+                response_mode,
             ):
-                rpc_request = await self.send(next_method, next_params)
+                rpc_request = await self.send(
+                    cast(RPCEndpoint, next_method), next_params
+                )
                 request_id = rpc_request.get("id")
                 if request_id is None:
                     raise ChainException("Persistent RPC request has no ID")
                 provider._request_processor.cache_request_information(
                     request_id,
-                    rpc_request.get("method", next_method),
+                    cast(RPCEndpoint, rpc_request.get("method", next_method)),
                     rpc_request.get("params", next_params),
                     formatters,
                 )
