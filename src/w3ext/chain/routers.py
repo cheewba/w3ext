@@ -1,5 +1,7 @@
 """Context-scoped provider selection for :class:`~w3ext.chain.Chain`."""
 
+import asyncio
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -33,9 +35,13 @@ class _RouterContext:
 _router_context: ContextVar[_RouterContext | None] = ContextVar(
     "chain_providers_router", default=None
 )
-_router_provider_cache: ContextVar[dict[int, AsyncBaseProvider | None] | None] = (
-    ContextVar("chain_router_provider_cache", default=None)
-)
+_router_provider_cache: ContextVar[
+    dict[
+        tuple[int, weakref.ReferenceType[asyncio.Task[Any]] | None],
+        AsyncBaseProvider | None,
+    ]
+    | None
+] = ContextVar("chain_router_provider_cache", default=None)
 
 
 @contextmanager
@@ -75,6 +81,9 @@ class RoutingProvider(AsyncJSONBaseProvider):
         self._provider_override: ContextVar[AsyncBaseProvider | None] = ContextVar(
             f"chain_provider_override_{id(self)}", default=None
         )
+        self._collecting_batch_info: ContextVar[bool] = ContextVar(
+            f"chain_collecting_batch_info_{id(self)}", default=False
+        )
 
     @contextmanager
     def use_provider(self, provider: AsyncBaseProvider) -> Iterator[None]:
@@ -84,6 +93,15 @@ class RoutingProvider(AsyncJSONBaseProvider):
             yield
         finally:
             self._provider_override.reset(token)
+
+    @contextmanager
+    def collect_batch_info(self) -> Iterator[None]:
+        """Keep Web3 from caching persistent requests before a batch exists."""
+        token = self._collecting_batch_info.set(True)
+        try:
+            yield
+        finally:
+            self._collecting_batch_info.reset(token)
 
     def _selected_provider(self) -> AsyncBaseProvider | None:
         override = self._provider_override.get()
@@ -96,7 +114,11 @@ class RoutingProvider(AsyncJSONBaseProvider):
             return self.explicit_provider
         if context is not None and context.router is not None:
             cache = _router_provider_cache.get() or {}
-            key = id(self)
+            try:
+                task = asyncio.current_task()
+            except RuntimeError:
+                task = None
+            key = (id(self), weakref.ref(task) if task is not None else None)
             if key in cache:
                 provider = cache[key]
             else:
@@ -173,6 +195,8 @@ class RoutingRequestManager(RequestManager):
 
     @property
     def _provider(self) -> AsyncBaseProvider:
+        if self._routing_provider._collecting_batch_info.get():
+            return self._routing_provider
         selected = self._routing_provider._selected_provider()
         if isinstance(selected, PersistentConnectionProvider):
             return selected

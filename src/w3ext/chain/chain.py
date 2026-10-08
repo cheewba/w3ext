@@ -371,22 +371,21 @@ class Chain:
             ...         token3.get_balance(address3)
             ...     )
         """
-        token = None
+        batcher = Batch(
+            self.__web3,
+            max_size=max_size,
+            max_wait=max_wait,
+            routing_provider=self._routing_provider,
+        )
+        store = _batcher_ctx_var.get() or {}
+        new_store = dict(store)
+        new_store[id(self)] = batcher
+        token = _batcher_ctx_var.set(new_store)
         try:
-            async with Batch(
-                self.__web3,
-                max_size=max_size,
-                max_wait=max_wait,
-                routing_provider=self._routing_provider,
-            ) as batcher:
-                store = _batcher_ctx_var.get() or {}
-                new_store = dict(store)
-                new_store[id(self)] = batcher
-                token = _batcher_ctx_var.set(new_store)
+            async with batcher:
                 yield batcher
         finally:
-            if token:
-                _batcher_ctx_var.reset(token)
+            _batcher_ctx_var.reset(token)
 
     @asynccontextmanager
     async def use_middlewares(self, *middlewares: list):

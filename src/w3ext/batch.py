@@ -41,6 +41,7 @@ from web3 import AsyncWeb3
 from web3._utils.batching import RPC_METHODS_UNSUPPORTED_DURING_BATCH
 from web3.method import Method
 from web3.providers import AsyncBaseProvider
+from web3.providers.persistent import PersistentConnectionProvider
 
 if TYPE_CHECKING:
     from .chain import Chain
@@ -86,9 +87,9 @@ def to_batch_aware_method(chain: "Chain", method: Callable):
             token = _batch_request_processed.set(True)
             try:
                 chain._web3.provider._is_batching = True
-                return await chain._add_to_batch_request_info(
-                    await method(*args, **kwargs)
-                )
+                with chain._routing_provider.collect_batch_info():
+                    request_info = await method(*args, **kwargs)
+                return await chain._add_to_batch_request_info(request_info)
             finally:
                 chain._web3.provider._is_batching = False
                 _batch_request_processed.reset(token)
@@ -328,15 +329,22 @@ class Batch:
                 else nullcontext()
             )
             with route:
-                batcher = self._web3.batch_requests()
-                batcher._validate_is_batching = _dummy_checker.__get__(
-                    batcher, batcher.__class__
-                )
-
-                for request in requests:
-                    batcher.add(request)
-
                 try:
+                    batcher = self._web3.batch_requests()
+                    batcher._validate_is_batching = _dummy_checker.__get__(
+                        batcher, batcher.__class__
+                    )
+
+                    for request in requests:
+                        batcher.add(request)
+
+                    if isinstance(provider, PersistentConnectionProvider):
+                        for request in requests:
+                            (method, params), formatters = await request
+                            provider._request_processor.cache_request_information(
+                                None, method, params, formatters
+                            )
+
                     async with semaphore:
                         responses = await batcher.async_execute()
                 except Exception as e:

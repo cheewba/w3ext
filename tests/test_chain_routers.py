@@ -5,9 +5,11 @@ import pytest
 from hexbytes import HexBytes
 from web3 import AsyncIPCProvider, WebSocketProvider
 from web3.exceptions import MethodNotSupported
+from web3.types import RPCEndpoint
 from web3.middleware import Web3Middleware, async_combine_middleware
 from web3.providers import AsyncBaseProvider
 
+from w3ext.account import Account
 from w3ext.chain import Chain, chain_providers_router
 from w3ext.exceptions import ChainException
 
@@ -207,6 +209,32 @@ def test_shared_router_context_selects_provider_per_task(monkeypatch):
     asyncio.run(check())
 
 
+def test_child_task_does_not_inherit_parent_provider_selection(monkeypatch):
+    monkeypatch.setattr(
+        "w3ext.chain.routers.get_chain_provider", lambda *_: StubProvider(1)
+    )
+    chain = Chain(1)
+    parent_provider = StubProvider(7)
+    child_provider = StubProvider(8)
+
+    class TaskRouter:
+        def get_chain_provider(self, chain_id, request_kwargs=None):
+            return (
+                child_provider
+                if asyncio.current_task().get_name() == "child"
+                else parent_provider
+            )
+
+    async def check():
+        with chain_providers_router(TaskRouter()):
+            assert await chain.eth.block_number == 7
+            child = asyncio.create_task(chain.eth.block_number, name="child")
+            assert await child == 8
+            assert await chain.eth.block_number == 7
+
+    asyncio.run(check())
+
+
 def test_batch_requests_use_active_router(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
@@ -366,5 +394,99 @@ def test_explicit_persistent_provider_supports_subscriptions(provider_class, end
                 await chain.eth.subscribe("newHeads")
         with chain_providers_router(None):
             assert chain._web3.provider is provider
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "endpoint"),
+    [
+        (WebSocketProvider, "ws://localhost:12345"),
+        (AsyncIPCProvider, "/tmp/w3ext-nonexistent.ipc"),
+    ],
+)
+def test_persistent_batch_initializes_request_ids_before_caching(
+    provider_class, endpoint
+):
+    chain = Chain(1)
+    provider = provider_class(endpoint)
+    provider.make_batch_request = AsyncMock(
+        return_value=[
+            {"jsonrpc": "2.0", "id": 0, "result": "0x2a"},
+            {"jsonrpc": "2.0", "id": 1, "result": "0x2b"},
+        ]
+    )
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_batch(max_size=2):
+                balances = await asyncio.wait_for(
+                    asyncio.gather(
+                        chain.eth.get_balance(address), chain.eth.get_balance(address)
+                    ),
+                    2,
+                )
+                assert balances == [42, 43]
+        provider.make_batch_request.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+def test_persistent_route_applies_context_request_middleware():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    sent = []
+
+    async def send_request(method, params):
+        sent.append((method, params))
+        return {"jsonrpc": "2.0", "id": len(sent), "method": method, "params": params}
+
+    provider.send_request = send_request
+
+    def rewrite(make_request, _w3):
+        async def middleware(method, params):
+            return await make_request(RPCEndpoint("custom_method"), params)
+
+        return middleware
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_middlewares(rewrite):
+                await chain._web3.manager.send(RPCEndpoint("eth_blockNumber"), [])
+            await chain._web3.manager.send(RPCEndpoint("eth_blockNumber"), [])
+        assert [method for method, _ in sent] == ["custom_method", "eth_blockNumber"]
+
+    asyncio.run(check())
+
+
+def test_send_transaction_signs_with_persistent_route(monkeypatch):
+    chain = Chain(1)
+    account = Account.from_key("0x" + "01" * 32)
+    provider = WebSocketProvider("ws://localhost:12345")
+    sent = []
+
+    async def send_request(method, params):
+        sent.append((method, params))
+        return {"jsonrpc": "2.0", "id": len(sent), "method": method, "params": params}
+
+    provider.send_request = send_request
+    chain._web3.manager.recv_for_request = AsyncMock(return_value=HexBytes("0x" + "ab" * 32))
+    monkeypatch.setattr("w3ext.utils.common.is_eip1559", AsyncMock(return_value=False))
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            await chain.send_transaction(
+                {
+                    "to": "0x0000000000000000000000000000000000000001",
+                    "value": 1,
+                    "nonce": 0,
+                    "gas": 21000,
+                    "gasPrice": 1,
+                },
+                account,
+            )
+        assert sent[-1][0] == "eth_sendRawTransaction"
+        assert sent[-1][1][0].startswith("0x")
 
     asyncio.run(check())

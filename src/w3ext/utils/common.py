@@ -297,52 +297,42 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
         else:
             self._accounts = accounts
 
+    async def async_request_processor(
+        self, method: RPCEndpoint, params: Any
+    ) -> tuple[RPCEndpoint, Any]:
+        if method != "eth_sendTransaction":
+            return method, params
+
+        w3 = cast(AsyncWeb3, self._w3)
+        transaction = params[0]
+        transaction = await fill_chain_id(w3, transaction)
+        transaction = await fill_nonce(w3, transaction)
+        transaction = await async_fill_transaction_defaults(w3, transaction)
+        transaction = await fill_gas_price(w3, transaction)
+        transaction = format_transaction(transaction)
+
+        if "from" not in transaction:
+            return method, params
+
+        accounts = (
+            self._accounts_fn() if self._accounts_fn is not None else self._accounts
+        )
+        sender = transaction.get("from")
+        if sender is None:
+            return method, params
+        sender = to_checksum_address(sender)
+        if sender not in accounts:
+            return method, params
+
+        # pylint: disable=unsubscriptable-object
+        account = accounts[sender]
+        raw_tx = account.sign_transaction(cast(Any, transaction)).raw_transaction
+        return RPCEndpoint("eth_sendRawTransaction"), [AsyncWeb3.to_hex(raw_tx)]
+
     async def async_wrap_make_request(self, make_request):
-        """
-        Wrap the request handler to intercept and sign transactions.
-
-        Intercepts eth_sendTransaction calls, fills transaction parameters,
-        signs with the appropriate account, and sends as raw transaction.
-
-        Args:
-            make_request: Original request handler
-
-        Returns:
-            Wrapped request handler
-        """
-
         async def middleware(method: RPCEndpoint, params: Any) -> RPCResponse:
-            if method != "eth_sendTransaction":
-                return await make_request(method, params)
-
-            w3 = cast(AsyncWeb3, self._w3)
-            transaction = params[0]
-            transaction = await fill_chain_id(w3, transaction)
-            transaction = await fill_nonce(w3, transaction)
-            transaction = await async_fill_transaction_defaults(w3, transaction)
-            transaction = await fill_gas_price(w3, transaction)
-            transaction = format_transaction(transaction)
-
-            if "from" not in transaction:
-                return await make_request(method, params)
-
-            accounts = (
-                self._accounts_fn() if self._accounts_fn is not None else self._accounts
-            )
-            sender = transaction.get("from")
-            if sender is None:
-                return await make_request(method, params)
-            sender = to_checksum_address(sender)
-            if sender not in accounts:
-                return await make_request(method, params)
-
-            # pylint: disable=unsubscriptable-object
-            account = accounts[sender]
-            raw_tx = account.sign_transaction(cast(Any, transaction)).raw_transaction
-
-            return await make_request(
-                RPCEndpoint("eth_sendRawTransaction"), [AsyncWeb3.to_hex(raw_tx)]
-            )
+            method, params = await self.async_request_processor(method, params)
+            return await make_request(method, params)
 
         return middleware
 
