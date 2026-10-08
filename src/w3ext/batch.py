@@ -347,6 +347,7 @@ class Batch:
             )
             with route, execution:
                 try:
+
                     async def execute():
                         batcher = self._web3.batch_requests()
                         batcher._validate_is_batching = _dummy_checker.__get__(

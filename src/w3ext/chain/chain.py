@@ -181,7 +181,9 @@ class AsyncWeb3(_AsyncWeb3):
         if entry is None or entry[0] is not provider:
             entry = (
                 provider,
-                RoutedSubscriptionManager(self, provider, self._chain._routing_provider),
+                RoutedSubscriptionManager(
+                    self, provider, self._chain._routing_provider
+                ),
             )
             self._subscription_managers[id(provider)] = entry
         return entry[1]
