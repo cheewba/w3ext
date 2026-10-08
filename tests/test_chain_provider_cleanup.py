@@ -55,7 +55,10 @@ class Router:
 @pytest.fixture
 def fallback(monkeypatch):
     provider = SessionProvider()
-    monkeypatch.setattr("w3ext.chain.routers.get_chain_provider", lambda *_: provider)
+    monkeypatch.setattr(
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: provider,
+    )
     return provider
 
 
