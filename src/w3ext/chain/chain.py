@@ -43,8 +43,8 @@ from ..utils import (
     load_abi,
     to_checksum_address,
 )
-from .chainlist import get_chain_provider
 from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
+from .routers import RoutingProvider
 
 ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "abi")
 _batcher_ctx_var: ContextVar[dict[int, Batch] | None] = ContextVar(
@@ -183,15 +183,17 @@ class Chain:
             name: Human-readable name for the chain (e.g., 'Ethereum Mainnet')
 
         Note:
-            This constructor creates an unconnected Chain instance. Use Chain.connect()
-            class method to create a connected instance, or call connect_rpc() afterwards.
+            This constructor creates a Chain without an explicit RPC. Requests use
+            Chainlist unless a provider router is active. Use Chain.connect() or
+            connect_rpc() to set an explicit RPC.
         """
         # Internal AsyncWeb3 instance with custom middleware
-        # Initialize with a dummy provider to prevent AutoProvider from probing IPC/localhost
+        # Keep one provider in Web3 so requests can select a route by context.
+        self._routing_provider = RoutingProvider(chain_id, request_kwargs)
         self.__web3: AsyncWeb3 = AsyncWeb3(
             self,
             middleware=self._DEFAULT_MIDDLEWARE,
-            provider=get_chain_provider(chain_id, request_kwargs),
+            provider=self._routing_provider,
         )
         cast(Any, self.__web3).eth = AsyncEthProxy(self.__web3.eth, self)
         # Chain ID stored as string for consistency
@@ -406,12 +408,11 @@ class Chain:
                 request_cache_validation_threshold=60 * 60,
             )
 
-        self.__web3.provider = provider
+        self._routing_provider.explicit_provider = provider
         await self._verify_chain_id(self.chain_id)
 
     async def close(self):
-        if await self.__web3.is_connected():
-            await self.__web3.provider.disconnect()
+        await self.__web3.provider.disconnect()
 
     @property
     def _web3(self) -> AsyncWeb3:
