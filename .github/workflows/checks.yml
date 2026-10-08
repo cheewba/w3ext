@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m venv .venv
-          .venv/bin/python -m pip install -e . "ruff==0.16.8"
+          .venv/bin/python -m pip install -e . "ruff==0.16.8" "pytest==9.0.2"
           npm install --global pyright@1.1.408
 
       - name: Ruff lint
@@ -40,3 +40,6 @@ jobs:
 
       - name: Import package
         run: .venv/bin/python -c "import w3ext"
+
+      - name: Tests
+        run: .venv/bin/python -m pytest -q tests
