@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from web3._utils.validation import raise_error_for_batch_response
 from web3.manager import RequestManager
 from web3.providers import AsyncBaseProvider
 from web3.providers.async_base import AsyncJSONBaseProvider
@@ -87,9 +88,6 @@ class RoutingProvider(AsyncJSONBaseProvider):
         self._executing_batch: ContextVar[bool] = ContextVar(
             f"chain_executing_batch_{id(self)}", default=False
         )
-        self._preparing_persistent_batch: ContextVar[bool] = ContextVar(
-            f"chain_preparing_persistent_batch_{id(self)}", default=False
-        )
 
     @contextmanager
     def use_provider(self, provider: AsyncBaseProvider) -> Iterator[None]:
@@ -117,15 +115,6 @@ class RoutingProvider(AsyncJSONBaseProvider):
             yield
         finally:
             self._executing_batch.reset(token)
-
-    @contextmanager
-    def prepare_persistent_batch(self) -> Iterator[None]:
-        """Allow Web3 to cache request information after batch IDs are ready."""
-        token = self._preparing_persistent_batch.set(True)
-        try:
-            yield
-        finally:
-            self._preparing_persistent_batch.reset(token)
 
     def _selected_provider(self) -> AsyncBaseProvider | None:
         override = self._provider_override.get()
@@ -236,6 +225,31 @@ class RoutingRequestManager(RequestManager):
         if not isinstance(provider, PersistentConnectionProvider):
             raise ChainException("A persistent RPC provider is not selected")
         return provider._request_processor
+
+    async def _async_make_batch_request(self, requests_info):
+        provider = self._provider
+        if not (
+            self._routing_provider._executing_batch.get()
+            and isinstance(provider, PersistentConnectionProvider)
+        ):
+            return await super()._async_make_batch_request(requests_info)
+
+        # Web3 normally looks up persistent batch formatters by a predicted RPC ID.
+        # Middleware can issue an RPC before the batch is encoded, consuming that ID.
+        # Keep each formatter with its original request and format the returned list.
+        request_func = await provider.batch_request_func(self.w3, self.middleware_onion)
+        unpacked = await asyncio.gather(*requests_info)
+        response = await request_func(
+            [(method, params) for (method, params), _ in unpacked]
+        )
+        if not isinstance(response, list):
+            raise_error_for_batch_response(response, self.logger)
+        if len(response) != len(unpacked):
+            raise ChainException("Batch response count does not match requests")
+        return [
+            self._format_batched_response(info, item)
+            for info, item in zip(unpacked, response)
+        ]
 
 
 __all__ = ["ChainProviderRouter", "chain_providers_router"]

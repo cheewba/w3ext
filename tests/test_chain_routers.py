@@ -405,7 +405,7 @@ def test_explicit_persistent_provider_supports_subscriptions(provider_class, end
         (AsyncIPCProvider, "/tmp/w3ext-nonexistent.ipc"),
     ],
 )
-def test_persistent_batch_initializes_request_ids_before_caching(
+def test_persistent_batch_formats_multiple_results(
     provider_class, endpoint
 ):
     chain = Chain(1)
@@ -476,6 +476,96 @@ def test_persistent_batch_chunks_do_not_overlap():
     asyncio.run(check())
 
 
+@pytest.mark.parametrize(
+    ("method", "result", "expected"),
+    [
+        ("call", "0x1234", HexBytes("0x1234")),
+        ("estimate_gas", "0x5208", 21000),
+    ],
+)
+def test_persistent_batch_formats_results_after_nested_chain_id_rpc(
+    method, result, expected
+):
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    nested_ids = []
+    batch_ids = []
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def socket_request(rpc_method, params, response_formatters=None):
+        assert rpc_method == "eth_chainId"
+        nested_ids.append(provider.form_request(rpc_method, params)["id"])
+        return 1
+
+    async def make_batch_request(requests):
+        encoded = [
+            provider.form_request(rpc_method, params)
+            for rpc_method, params in requests
+        ]
+        batch_ids.extend(request["id"] for request in encoded)
+        return [
+            {"jsonrpc": "2.0", "id": request["id"], "result": result}
+            for request in encoded
+        ]
+
+    chain._web3.manager.socket_request = socket_request
+    provider.make_batch_request = make_batch_request
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_batch(max_size=1):
+                actual = await getattr(chain.eth, method)(
+                    {"to": address, "chainId": 1}
+                )
+                assert actual == expected
+        assert nested_ids
+        assert batch_ids[0] > nested_ids[0]
+
+    asyncio.run(check())
+
+
+def test_persistent_batch_formats_contract_call_after_nested_chain_id_rpc():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    address = "0x0000000000000000000000000000000000000001"
+    abi = [
+        {
+            "type": "function",
+            "name": "value",
+            "stateMutability": "view",
+            "inputs": [],
+            "outputs": [{"name": "", "type": "uint256"}],
+        }
+    ]
+    contract = chain.contract(address, abi)
+    nested_ids = []
+    batch_ids = []
+
+    async def socket_request(method, params, response_formatters=None):
+        assert method == "eth_chainId"
+        nested_ids.append(provider.form_request(method, params)["id"])
+        return 1
+
+    async def make_batch_request(requests):
+        encoded = [provider.form_request(method, params) for method, params in requests]
+        batch_ids.extend(request["id"] for request in encoded)
+        return [
+            {"jsonrpc": "2.0", "id": request["id"], "result": "0x" + "0" * 62 + "2a"}
+            for request in encoded
+        ]
+
+    chain._web3.manager.socket_request = socket_request
+    provider.make_batch_request = make_batch_request
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_batch(max_size=1):
+                assert await contract.functions.value().call({"chainId": 1}) == 42
+        assert batch_ids[0] > nested_ids[0]
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("flush_on_exit", [False, True])
 def test_batch_validation_middleware_queries_chain_id_outside_collection(
     flush_on_exit,
@@ -527,6 +617,59 @@ def test_context_response_middleware_uses_actual_http_batch_response():
                 assert await chain.eth.get_balance(address) == 8
         assert len(provider.batches) == 1
         assert seen == ["request", "response"]
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_context_middleware_can_short_circuit_batch_requests(persistent):
+    chain = Chain(1)
+    provider = (
+        WebSocketProvider("ws://localhost:12345") if persistent else StubProvider(7)
+    )
+    sent_batches = []
+    cached = "0x0000000000000000000000000000000000000001"
+    uncached = "0x0000000000000000000000000000000000000002"
+
+    if persistent:
+        async def make_batch_request(requests):
+            sent_batches.append(requests)
+            return [
+                {
+                    "jsonrpc": "2.0",
+                    "id": provider.form_request(method, params)["id"],
+                    "result": "0x7",
+                }
+                for method, params in requests
+            ]
+
+        provider.make_batch_request = make_batch_request
+    else:
+        sent_batches = provider.batches
+
+    def cache(make_request, _w3):
+        async def middleware(method, params):
+            if method == "eth_getBalance" and params[0].lower() == cached.lower():
+                return {"jsonrpc": "2.0", "id": 99, "result": "0xa"}
+            return await make_request(method, params)
+
+        return middleware
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_middlewares(cache):
+                async with chain.use_batch(max_size=2):
+                    results = await asyncio.gather(
+                        chain.eth.get_balance(cached), chain.eth.get_balance(uncached)
+                    )
+                assert results == [10, 7]
+
+                async with chain.use_batch(max_size=2):
+                    cached_results = await asyncio.gather(
+                        chain.eth.get_balance(cached), chain.eth.get_balance(cached)
+                    )
+                assert cached_results == [10, 10]
+        assert [len(batch) for batch in sent_batches] == [1]
 
     asyncio.run(check())
 

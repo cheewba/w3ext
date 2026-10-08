@@ -83,22 +83,29 @@ class DynamicContextMiddleware(Web3Middleware):
                         (forwarded, task), return_when=asyncio.FIRST_COMPLETED
                     )
                     if not forwarded.done():
+                        # A cache middleware may complete this request locally.
                         await task
+                        prepared.append((None, None, task))
+                    else:
+                        prepared.append((forwarded.result(), response, task))
+
+                forwarded_requests = [
+                    request for request, _, _ in prepared if request is not None
+                ]
+                if forwarded_requests:
+                    actual_responses = await make_batch_request(forwarded_requests)
+                    if not isinstance(actual_responses, list):
+                        return actual_responses
+                    if len(actual_responses) != len(forwarded_requests):
                         raise RuntimeError(
-                            "Context middleware did not forward the RPC request"
+                            "Batch response count does not match forwarded requests"
                         )
-                    prepared.append((forwarded.result(), response, task))
 
-                actual_responses = await make_batch_request(
-                    [request for request, _, _ in prepared]
-                )
-                if not isinstance(actual_responses, list):
-                    return actual_responses
-                if len(actual_responses) != len(prepared):
-                    raise RuntimeError("Batch response count does not match requests")
-
-                for (_, response, _), actual in zip(prepared, actual_responses):
-                    response.set_result(actual)
+                    actual = iter(actual_responses)
+                    for request, response, _ in prepared:
+                        if request is not None:
+                            assert response is not None
+                            response.set_result(next(actual))
                 return await asyncio.gather(*(task for _, _, task in prepared))
             finally:
                 pending = [task for task in running if not task.done()]

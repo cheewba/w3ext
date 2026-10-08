@@ -356,20 +356,6 @@ class Batch:
                         for request in requests:
                             batcher.add(request)
 
-                        if isinstance(provider, PersistentConnectionProvider):
-                            preparation = (
-                                self._routing_provider.prepare_persistent_batch()
-                                if self._routing_provider is not None
-                                else nullcontext()
-                            )
-                            with preparation:
-                                for request in requests:
-                                    (method, params), formatters = await request
-                                    processor = provider._request_processor
-                                    processor.cache_request_information(
-                                        None, method, params, formatters
-                                    )
-
                         async with semaphore:
                             return await batcher.async_execute()
 

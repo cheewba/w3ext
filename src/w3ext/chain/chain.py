@@ -111,10 +111,7 @@ def patch_provider(provider_instance, chain):
     class PatchedProvider(orig_cls):
         @property
         def _is_batching(self):
-            return (
-                chain._routing_provider._preparing_persistent_batch.get()
-                or chain._is_batching
-            )
+            return chain._is_batching
 
         @_is_batching.setter
         def _is_batching(self, value):
