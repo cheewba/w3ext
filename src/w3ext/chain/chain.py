@@ -118,9 +118,37 @@ def patch_provider(provider_instance, chain):
             # don't modify batching var
             pass
 
+        @property
+        def has_persistent_connection(self):
+            return (
+                orig_cls.has_persistent_connection
+                and not chain._routing_provider._processing_responses_directly.get()
+            )
+
     # Change the instance's class to the new patched subclass.
     provider_instance.__class__ = PatchedProvider
     return provider_instance
+
+
+class RoutedSubscriptionManager(SubscriptionManager):
+    """Keep a retained subscription manager on its original RPC connection."""
+
+    def __init__(self, w3, provider, routing_provider):
+        self._routing_provider = routing_provider
+        with routing_provider.use_provider(provider):
+            super().__init__(w3)
+
+    async def subscribe(self, subscriptions):
+        with self._routing_provider.use_provider(self._provider):
+            return await super().subscribe(subscriptions)
+
+    async def unsubscribe(self, subscriptions):
+        with self._routing_provider.use_provider(self._provider):
+            return await super().unsubscribe(subscriptions)
+
+    async def handle_subscriptions(self, run_forever: bool = False) -> None:
+        with self._routing_provider.use_provider(self._provider):
+            await super().handle_subscriptions(run_forever)
 
 
 class AsyncWeb3(_AsyncWeb3):
@@ -151,7 +179,10 @@ class AsyncWeb3(_AsyncWeb3):
         provider = self._selected_persistent_provider()
         entry = self._subscription_managers.get(id(provider))
         if entry is None or entry[0] is not provider:
-            entry = (provider, SubscriptionManager(self))
+            entry = (
+                provider,
+                RoutedSubscriptionManager(self, provider, self._chain._routing_provider),
+            )
             self._subscription_managers[id(provider)] = entry
         return entry[1]
 

@@ -17,6 +17,7 @@ from web3.types import RPCEndpoint
 
 from ..exceptions import ChainException
 from .chainlist import get_chain_provider
+from .middlewares import _ShortCircuitResponse
 
 
 class ChainProviderRouter(Protocol):
@@ -88,6 +89,9 @@ class RoutingProvider(AsyncJSONBaseProvider):
         self._executing_batch: ContextVar[bool] = ContextVar(
             f"chain_executing_batch_{id(self)}", default=False
         )
+        self._processing_responses_directly: ContextVar[bool] = ContextVar(
+            f"chain_processing_responses_directly_{id(self)}", default=False
+        )
 
     @contextmanager
     def use_provider(self, provider: AsyncBaseProvider) -> Iterator[None]:
@@ -115,6 +119,15 @@ class RoutingProvider(AsyncJSONBaseProvider):
             yield
         finally:
             self._executing_batch.reset(token)
+
+    @contextmanager
+    def process_responses_directly(self) -> Iterator[None]:
+        """Apply Web3 response middleware without a persistent cache entry."""
+        token = self._processing_responses_directly.set(True)
+        try:
+            yield
+        finally:
+            self._processing_responses_directly.reset(token)
 
     def _selected_provider(self) -> AsyncBaseProvider | None:
         override = self._provider_override.get()
@@ -226,6 +239,23 @@ class RoutingRequestManager(RequestManager):
             raise ChainException("A persistent RPC provider is not selected")
         return provider._request_processor
 
+    async def socket_request(self, method, params, response_formatters=None):
+        try:
+            return await super().socket_request(method, params, response_formatters)
+        except _ShortCircuitResponse as short_circuit:
+            response = short_circuit.response
+            with self._routing_provider.process_responses_directly():
+                for middleware in reversed(
+                    self.middleware_onion.as_tuple_of_middleware()
+                ):
+                    response = await middleware(self.w3).async_response_processor(
+                        method, response
+                    )
+            return self._format_batched_response(
+                ((method, params), response_formatters or ((), (), ())),
+                response,
+            )
+
     async def _async_make_batch_request(self, requests_info):
         provider = self._provider
         if not (
@@ -239,9 +269,10 @@ class RoutingRequestManager(RequestManager):
         # Keep each formatter with its original request and format the returned list.
         request_func = await provider.batch_request_func(self.w3, self.middleware_onion)
         unpacked = await asyncio.gather(*requests_info)
-        response = await request_func(
-            [(method, params) for (method, params), _ in unpacked]
-        )
+        with self._routing_provider.process_responses_directly():
+            response = await request_func(
+                [(method, params) for (method, params), _ in unpacked]
+            )
         if not isinstance(response, list):
             raise_error_for_batch_response(response, self.logger)
         if len(response) != len(unpacked):

@@ -2,12 +2,16 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from eth_typing import HexStr
 from hexbytes import HexBytes
 from web3 import AsyncIPCProvider, WebSocketProvider
-from web3.exceptions import MethodNotSupported
+from web3._utils.caching import generate_cache_key
+from web3.exceptions import MethodNotSupported, SubscriptionProcessingFinished
 from web3.types import RPCEndpoint
 from web3.middleware import Web3Middleware, async_combine_middleware
 from web3.providers import AsyncBaseProvider
+from web3.providers.persistent.request_processor import RequestInformation
+from web3.utils.subscriptions import NewHeadsSubscription
 
 from w3ext.account import Account
 from w3ext.chain import Chain, chain_providers_router
@@ -398,6 +402,59 @@ def test_explicit_persistent_provider_supports_subscriptions(provider_class, end
     asyncio.run(check())
 
 
+def test_retained_subscription_manager_uses_its_provider_in_child_task():
+    chain = Chain(1)
+    first = WebSocketProvider("ws://localhost:12345")
+    second = WebSocketProvider("ws://localhost:12346")
+    seen = []
+    subscription_id = HexStr("0xabc")
+
+    async def handler(context):
+        seen.append((context.result, chain._web3.provider))
+
+    async def check():
+        with chain_providers_router(StubRouter(first)):
+            manager = chain._web3.subscription_manager
+            subscription = NewHeadsSubscription(handler=handler)
+            subscription.manager = manager
+            subscription._id = subscription_id
+            manager._validate_and_normalize_label(subscription)
+            manager._add_subscription(subscription)
+
+            processor = first._request_processor
+            processor._request_information_cache.cache(
+                generate_cache_key(subscription_id),
+                RequestInformation(
+                    RPCEndpoint("eth_subscribe"),
+                    ["newHeads"],
+                    ((), (), ()),
+                    subscription_id=subscription_id,
+                ),
+            )
+            queue = processor._handler_subscription_queue
+            await queue.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "eth_subscription",
+                    "params": {"subscription": subscription_id, "result": "0x2a"},
+                }
+            )
+            await queue.put(SubscriptionProcessingFinished())
+
+        async def unsubscribe(subscription_id):
+            assert chain._web3.provider is first
+            return True
+
+        chain._web3.eth._unsubscribe = AsyncMock(side_effect=unsubscribe)
+        with chain_providers_router(StubRouter(second), force=True):
+            await asyncio.create_task(manager.handle_subscriptions())
+            assert await manager.unsubscribe(subscription)
+        assert seen == [("0x2a", first)]
+        chain._web3.eth._unsubscribe.assert_awaited_once_with(subscription_id)
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize(
     ("provider_class", "endpoint"),
     [
@@ -429,6 +486,25 @@ def test_persistent_batch_formats_multiple_results(
                 )
                 assert balances == [42, 43]
         provider.make_batch_request.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+def test_persistent_batch_applies_poa_response_middleware():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    extra_data = "0x" + "ab" * 33
+    block = {"number": "0x1", "extraData": extra_data, "transactions": []}
+    provider.make_batch_request = AsyncMock(
+        return_value=[{"jsonrpc": "2.0", "id": 0, "result": block}]
+    )
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_batch(max_size=1):
+                result = await chain.eth.get_block(1)
+        assert result["proofOfAuthorityData"] == HexBytes(extra_data)
+        assert "extraData" not in result
 
     asyncio.run(check())
 
@@ -670,6 +746,36 @@ def test_context_middleware_can_short_circuit_batch_requests(persistent):
                     )
                 assert cached_results == [10, 10]
         assert [len(batch) for batch in sent_batches] == [1]
+
+    asyncio.run(check())
+
+
+def test_context_middleware_can_short_circuit_persistent_single_request():
+    chain = Chain(1)
+    provider = WebSocketProvider("ws://localhost:12345")
+    provider.send_request = AsyncMock(side_effect=AssertionError("RPC was sent"))
+    address = "0x0000000000000000000000000000000000000001"
+    extra_data = "0x" + "ab" * 33
+
+    def cache(make_request, _w3):
+        async def middleware(method, params):
+            if method == "eth_getBalance":
+                result = "0xa"
+            elif method == "eth_getBlockByNumber":
+                result = {"number": "0x1", "extraData": extra_data, "transactions": []}
+            else:
+                raise AssertionError(f"Unexpected method: {method}")
+            return {"jsonrpc": "2.0", "id": 99, "result": result}
+
+        return middleware
+
+    async def check():
+        with chain_providers_router(StubRouter(provider)):
+            async with chain.use_middlewares(cache):
+                assert await chain.eth.get_balance(address) == 10
+                block = await chain.eth.get_block(1)
+                assert block["proofOfAuthorityData"] == HexBytes(extra_data)
+        provider.send_request.assert_not_awaited()
 
     asyncio.run(check())
 

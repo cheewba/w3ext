@@ -16,6 +16,11 @@ class _ForwardedRequest(BaseException):
         self.params = params
 
 
+class _ShortCircuitResponse(BaseException):
+    def __init__(self, response):
+        self.response = response
+
+
 class DynamicContextMiddleware(Web3Middleware):
     def __init__(self, w3, chain_ref):
         super().__init__(w3)
@@ -48,10 +53,10 @@ class DynamicContextMiddleware(Web3Middleware):
 
         handler = await self._wrap_active_middlewares(capture)
         try:
-            await handler(method, params)
+            response = await handler(method, params)
         except _ForwardedRequest as forwarded:
             return forwarded.method, forwarded.params
-        raise RuntimeError("Context middleware did not forward the RPC request")
+        raise _ShortCircuitResponse(response)
 
     async def async_wrap_make_batch_request(self, make_batch_request):
         async def middleware(requests):
