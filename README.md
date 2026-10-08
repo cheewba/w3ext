@@ -111,7 +111,19 @@ context uses `force=True`. Passing `None` disables routers and Chainlist in that
 context, leaving only explicitly connected RPCs. Routers should return an
 `AsyncBaseProvider` or `None`; reuse provider instances if they hold connection
 state. Each task reuses its first router selection per chain until the context
-exits.
+exits. Connection lifetime belongs to the Chain: leaving a routing context keeps
+its providers available for shared connections and retained subscriptions.
+`await chain.close()` disconnects all providers selected for that Chain, including
+providers from earlier scopes and child tasks. Put cleanup in `finally` when
+cancelling a group of requests:
+
+```python
+try:
+    with chain_providers_router(MyRouter()):
+        balance = await chain.get_balance(address)
+finally:
+    await chain.close()
+```
 
 #### Balance Queries
 

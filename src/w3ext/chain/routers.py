@@ -57,7 +57,8 @@ def chain_providers_router(
     provider for a chain, Chainlist is used. Passing ``None`` disables all
     routers, including Chainlist, while preserving explicitly connected RPCs.
     A task reuses its first provider selection for each chain until this context
-    exits.
+    exits. Provider connections remain open until ``Chain.close()``; exiting
+    this selection context does not disconnect shared providers.
     """
     token = _router_context.set(_RouterContext(router, force))
     cache_token = _router_provider_cache.set({})
@@ -81,6 +82,9 @@ class RoutingProvider(AsyncJSONBaseProvider):
         )
         self.chainlist_provider = get_chain_provider(chain_id, self.request_kwargs)
         self.explicit_provider: AsyncBaseProvider | None = None
+        # Routing scopes cache selections, but the Chain owns their connections.
+        # Keep child-task providers too, until an explicit disconnect.
+        self._router_providers: dict[int, AsyncBaseProvider] = {}
         self._provider_override: ContextVar[AsyncBaseProvider | None] = ContextVar(
             f"chain_provider_override_{id(self)}", default=None
         )
@@ -169,6 +173,7 @@ class RoutingProvider(AsyncJSONBaseProvider):
             if provider is not None:
                 if not isinstance(provider, AsyncBaseProvider):
                     raise TypeError("Router must return an AsyncBaseProvider or None")
+                self._router_providers[id(provider)] = provider
                 return provider
         return self.chainlist_provider
 
@@ -222,9 +227,26 @@ class RoutingProvider(AsyncJSONBaseProvider):
         )
 
     async def disconnect(self) -> None:
-        provider = self._selected_provider()
-        if provider is not None:
-            await provider.disconnect()
+        """Close all providers used by this Chain, across tasks and scopes."""
+        providers = dict(self._router_providers)
+        for provider in (self.chainlist_provider, self.explicit_provider):
+            if provider is not None:
+                providers[id(provider)] = provider
+
+        # Do not select a route here: cleanup must not create another provider.
+        results = await asyncio.gather(
+            *(provider.disconnect() for provider in providers.values()),
+            return_exceptions=True,
+        )
+        for (key, provider), result in zip(providers.items(), results):
+            if (
+                not isinstance(result, BaseException)
+                and self._router_providers.get(key) is provider
+            ):
+                self._router_providers.pop(key)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 class RoutingRequestManager(RequestManager):
