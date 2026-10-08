@@ -6,8 +6,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from web3.manager import RequestManager
 from web3.providers import AsyncBaseProvider
 from web3.providers.async_base import AsyncJSONBaseProvider
+from web3.providers.persistent import PersistentConnectionProvider
 from web3.types import RPCEndpoint
 
 from ..exceptions import ChainException
@@ -31,6 +33,9 @@ class _RouterContext:
 _router_context: ContextVar[_RouterContext | None] = ContextVar(
     "chain_providers_router", default=None
 )
+_router_provider_cache: ContextVar[dict[int, AsyncBaseProvider | None] | None] = (
+    ContextVar("chain_router_provider_cache", default=None)
+)
 
 
 @contextmanager
@@ -42,11 +47,15 @@ def chain_providers_router(
     An explicit RPC takes precedence unless ``force=True``. If the router has no
     provider for a chain, Chainlist is used. Passing ``None`` disables all
     routers, including Chainlist, while preserving explicitly connected RPCs.
+    A task reuses its first provider selection for each chain until this context
+    exits.
     """
     token = _router_context.set(_RouterContext(router, force))
+    cache_token = _router_provider_cache.set({})
     try:
         yield
     finally:
+        _router_provider_cache.reset(cache_token)
         _router_context.reset(token)
 
 
@@ -86,9 +95,16 @@ class RoutingProvider(AsyncJSONBaseProvider):
         if self.explicit_provider is not None and not (context and context.force):
             return self.explicit_provider
         if context is not None and context.router is not None:
-            provider = context.router.get_chain_provider(
-                self.chain_id, self.request_kwargs
-            )
+            cache = _router_provider_cache.get() or {}
+            key = id(self)
+            if key in cache:
+                provider = cache[key]
+            else:
+                provider = context.router.get_chain_provider(
+                    self.chain_id, self.request_kwargs
+                )
+                # Copy before writing: child tasks inherit context values.
+                _router_provider_cache.set({**cache, key: provider})
             if provider is not None:
                 if not isinstance(provider, AsyncBaseProvider):
                     raise TypeError("Router must return an AsyncBaseProvider or None")
@@ -148,6 +164,30 @@ class RoutingProvider(AsyncJSONBaseProvider):
         provider = self._selected_provider()
         if provider is not None:
             await provider.disconnect()
+
+
+class RoutingRequestManager(RequestManager):
+    """Expose persistent providers directly to Web3's subscription machinery."""
+
+    _routing_provider: RoutingProvider
+
+    @property
+    def _provider(self) -> AsyncBaseProvider:
+        selected = self._routing_provider._selected_provider()
+        if isinstance(selected, PersistentConnectionProvider):
+            return selected
+        return self._routing_provider
+
+    @_provider.setter
+    def _provider(self, provider: AsyncBaseProvider) -> None:
+        self._routing_provider.explicit_provider = provider
+
+    @property
+    def _request_processor(self):  # pyright: ignore[reportIncompatibleVariableOverride]
+        provider = self._provider
+        if not isinstance(provider, PersistentConnectionProvider):
+            raise ChainException("A persistent RPC provider is not selected")
+        return provider._request_processor
 
 
 __all__ = ["ChainProviderRouter", "chain_providers_router"]

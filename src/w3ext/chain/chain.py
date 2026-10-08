@@ -20,6 +20,7 @@ from hexbytes import HexBytes
 from web3 import AsyncHTTPProvider
 from web3 import AsyncWeb3 as _AsyncWeb3
 from web3.eth import AsyncEth
+from web3.exceptions import Web3ValidationError
 from web3.middleware import (
     AttributeDictMiddleware,
     BufferedGasEstimateMiddleware,
@@ -28,6 +29,8 @@ from web3.middleware import (
     ValidationMiddleware,
 )
 from web3.providers import AsyncBaseProvider
+from web3.providers.persistent import PersistentConnection, PersistentConnectionProvider
+from web3.providers.persistent.subscription_manager import SubscriptionManager
 from web3.types import BlockIdentifier, StateOverride, TxParams, TxReceipt
 
 from ..account import Account
@@ -44,7 +47,7 @@ from ..utils import (
     to_checksum_address,
 )
 from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
-from .routers import RoutingProvider
+from .routers import RoutingProvider, RoutingRequestManager
 
 ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "abi")
 _batcher_ctx_var: ContextVar[dict[int, Batch] | None] = ContextVar(
@@ -123,8 +126,44 @@ def patch_provider(provider_instance, chain):
 
 class AsyncWeb3(_AsyncWeb3):
     def __init__(self, chain: "Chain", *args, **kwargs) -> None:
+        self._subscription_managers: dict[
+            int, tuple[PersistentConnectionProvider, SubscriptionManager]
+        ] = {}
+        self._persistent_connections: dict[
+            int, tuple[PersistentConnectionProvider, PersistentConnection]
+        ] = {}
         super().__init__(*args, **kwargs)
         self._chain = chain
+        self.manager.__class__ = RoutingRequestManager
+        cast(
+            RoutingRequestManager, self.manager
+        )._routing_provider = chain._routing_provider
+
+    def _selected_persistent_provider(self) -> PersistentConnectionProvider:
+        provider = self.provider
+        if not isinstance(provider, PersistentConnectionProvider):
+            raise Web3ValidationError(
+                "A persistent RPC provider is required for subscriptions"
+            )
+        return provider
+
+    @property
+    def subscription_manager(self) -> SubscriptionManager:
+        provider = self._selected_persistent_provider()
+        entry = self._subscription_managers.get(id(provider))
+        if entry is None or entry[0] is not provider:
+            entry = (provider, SubscriptionManager(self))
+            self._subscription_managers[id(provider)] = entry
+        return entry[1]
+
+    @property
+    def socket(self) -> PersistentConnection:
+        provider = self._selected_persistent_provider()
+        entry = self._persistent_connections.get(id(provider))
+        if entry is None or entry[0] is not provider:
+            entry = (provider, PersistentConnection(self))
+            self._persistent_connections[id(provider)] = entry
+        return entry[1]
 
     def __getattribute__(self, name: str) -> Any:
         value = super().__getattribute__(name)

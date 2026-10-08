@@ -110,7 +110,8 @@ before the context. An RPC set with `connect_rpc` takes precedence unless the
 context uses `force=True`. Passing `None` disables routers and Chainlist in that
 context, leaving only explicitly connected RPCs. Routers should return an
 `AsyncBaseProvider` or `None`; reuse provider instances if they hold connection
-state.
+state. Each task reuses its first router selection per chain until the context
+exits.
 
 #### Balance Queries
 

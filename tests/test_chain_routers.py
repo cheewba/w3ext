@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 from hexbytes import HexBytes
+from web3 import AsyncIPCProvider, WebSocketProvider
+from web3.exceptions import MethodNotSupported
 from web3.middleware import Web3Middleware, async_combine_middleware
 from web3.providers import AsyncBaseProvider
 
@@ -158,7 +160,7 @@ def test_none_disables_all_routers_but_keeps_explicit_rpc(monkeypatch):
         with chain_providers_router(outer, force=True):
             with chain_providers_router(None, force=True):
                 assert await chain.eth.block_number == 3
-        assert outer.calls == [(1, None), (1, None)]
+        assert outer.calls == [(1, None)]
 
     asyncio.run(check())
 
@@ -177,6 +179,30 @@ def test_router_context_is_isolated_across_async_tasks(monkeypatch):
     async def check():
         assert await asyncio.gather(read(7), read(8)) == [7, 8]
         assert await chain.eth.block_number == 1
+
+    asyncio.run(check())
+
+
+def test_shared_router_context_selects_provider_per_task(monkeypatch):
+    monkeypatch.setattr(
+        "w3ext.chain.routers.get_chain_provider", lambda *_: StubProvider(1)
+    )
+    chain = Chain(1)
+    providers = {"first": StubProvider(7), "second": StubProvider(8)}
+
+    class TaskRouter:
+        def get_chain_provider(self, chain_id, request_kwargs=None):
+            return providers[asyncio.current_task().get_name()]
+
+    async def read():
+        await asyncio.sleep(0)
+        return await chain.eth.block_number
+
+    async def check():
+        with chain_providers_router(TaskRouter()):
+            first = asyncio.create_task(read(), name="first")
+            second = asyncio.create_task(read(), name="second")
+            assert await asyncio.gather(first, second) == [7, 8]
 
     asyncio.run(check())
 
@@ -295,5 +321,50 @@ def test_ccip_policy_follows_selected_provider():
         eth._call.assert_awaited_once()
         eth._durin_call.assert_not_awaited()
         assert chain._web3.provider.global_ccip_read_enabled is True
+
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize(
+    ("provider_class", "endpoint"),
+    [
+        (WebSocketProvider, "ws://localhost:12345"),
+        (AsyncIPCProvider, "/tmp/w3ext-nonexistent.ipc"),
+    ],
+)
+def test_explicit_persistent_provider_supports_subscriptions(provider_class, endpoint):
+    async def check():
+        chain = Chain(1)
+        provider = provider_class(endpoint)
+        chain._web3.manager.socket_request = AsyncMock(return_value=1)
+
+        await chain.connect_rpc(provider)
+        chain._web3.manager.socket_request.assert_awaited_once()
+        assert chain._web3.provider is provider
+        assert chain._web3.manager._request_processor is provider._request_processor
+
+        subscribe = AsyncMock(return_value="0xabc")
+        first_manager = chain._web3.subscription_manager
+        first_socket = chain._web3.socket
+        first_manager.subscribe = subscribe
+        assert await chain.eth.subscribe("newHeads") == "0xabc"
+        subscribe.assert_awaited_once()
+
+        other = provider_class(endpoint)
+        with chain_providers_router(StubRouter(other), force=True):
+            assert chain._web3.provider is other
+            assert chain._web3.manager._request_processor is other._request_processor
+            assert chain._web3.subscription_manager._provider is other
+            assert chain._web3.subscription_manager is not first_manager
+            assert chain._web3.socket.provider is other
+            assert chain._web3.socket is not first_socket
+        assert chain._web3.subscription_manager is first_manager
+        assert chain._web3.socket is first_socket
+
+        with chain_providers_router(StubRouter(StubProvider(2)), force=True):
+            with pytest.raises(MethodNotSupported):
+                await chain.eth.subscribe("newHeads")
+        with chain_providers_router(None):
+            assert chain._web3.provider is provider
 
     asyncio.run(check())
