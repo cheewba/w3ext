@@ -20,6 +20,8 @@ from hexbytes import HexBytes
 from web3 import AsyncHTTPProvider
 from web3 import AsyncWeb3 as _AsyncWeb3
 from web3.eth import AsyncEth
+from web3.exceptions import Web3ValidationError
+from web3.manager import _AsyncPersistentMessageStream
 from web3.middleware import (
     AttributeDictMiddleware,
     BufferedGasEstimateMiddleware,
@@ -28,6 +30,8 @@ from web3.middleware import (
     ValidationMiddleware,
 )
 from web3.providers import AsyncBaseProvider
+from web3.providers.persistent import PersistentConnection, PersistentConnectionProvider
+from web3.providers.persistent.subscription_manager import SubscriptionManager
 from web3.types import BlockIdentifier, StateOverride, TxParams, TxReceipt
 
 from ..account import Account
@@ -43,8 +47,8 @@ from ..utils import (
     load_abi,
     to_checksum_address,
 )
-from .chainlist import get_chain_provider
 from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
+from .routers import RoutingProvider, RoutingRequestManager
 
 ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "abi")
 _batcher_ctx_var: ContextVar[dict[int, Batch] | None] = ContextVar(
@@ -52,6 +56,9 @@ _batcher_ctx_var: ContextVar[dict[int, Batch] | None] = ContextVar(
 )
 _accounts_ctx_var: ContextVar[dict[int, dict[ChecksumAddress, LocalAccount]] | None] = (
     ContextVar("_accounts_ctx_var", default=None)
+)
+_active_chain_ctx_var: ContextVar["Chain | None"] = ContextVar(
+    "_active_chain_ctx_var", default=None
 )
 
 
@@ -96,11 +103,8 @@ class AsyncEthProxy:
         super().__setattr__(name, value)
 
 
-def patch_provider(provider_instance, chain):
-    """
-    Dynamically creates a subclass of the provider's class that adds a property
-    _is_batching, then changes the instance's __class__ to that subclass.
-    """
+def patch_provider(provider_instance):
+    """Expose the current task's Chain state through a shared provider."""
     # Save the original class
     orig_cls = provider_instance.__class__
 
@@ -108,28 +112,150 @@ def patch_provider(provider_instance, chain):
     class PatchedProvider(orig_cls):
         @property
         def _is_batching(self):
-            # Custom getter: return whether _batcher_ctx_var indicates batching is active.
-            return chain._is_batching
+            # Web3's listener runs in a different task from the batch caller.
+            listener_task = getattr(self, "_message_listener_task", None)
+            if listener_task is not None and asyncio.current_task() is listener_task:
+                return getattr(self, "_w3ext_wire_batch_active", False)
+            chain = _active_chain_ctx_var.get()
+            return chain._is_batching if chain is not None else False
 
         @_is_batching.setter
         def _is_batching(self, value):
             # don't modify batching var
             pass
 
+        @property
+        def has_persistent_connection(self):
+            chain = _active_chain_ctx_var.get()
+            return orig_cls.has_persistent_connection and not (
+                chain is not None
+                and chain._routing_provider._processing_responses_directly.get()
+            )
+
     # Change the instance's class to the new patched subclass.
     provider_instance.__class__ = PatchedProvider
     return provider_instance
 
 
+class RoutedSubscriptionManager(SubscriptionManager):
+    """Keep a retained subscription manager on its original RPC connection."""
+
+    def __init__(self, w3, provider, routing_provider):
+        self._routing_provider = routing_provider
+        with routing_provider.use_provider(provider):
+            super().__init__(w3)
+
+    async def subscribe(self, subscriptions):
+        with self._routing_provider.use_provider(self._provider):
+            return await super().subscribe(subscriptions)
+
+    async def unsubscribe(self, subscriptions):
+        with self._routing_provider.use_provider(self._provider):
+            return await super().unsubscribe(subscriptions)
+
+    async def handle_subscriptions(self, run_forever: bool = False) -> None:
+        with self._routing_provider.use_provider(self._provider):
+            await super().handle_subscriptions(run_forever)
+
+
+class RoutedPersistentMessageStream(_AsyncPersistentMessageStream):
+    def __init__(self, manager, provider, routing_provider):
+        self._bound_provider = provider
+        self._routing_provider = routing_provider
+        with routing_provider.use_provider(provider):
+            super().__init__(manager)
+
+    async def __anext__(self):
+        with self._routing_provider.use_provider(self._bound_provider):
+            return await super().__anext__()
+
+
+class RoutedPersistentConnection(PersistentConnection):
+    def __init__(self, w3, provider, routing_provider):
+        self._routing_provider = routing_provider
+        with routing_provider.use_provider(provider):
+            super().__init__(w3)
+
+    @property
+    def subscriptions(self):
+        with self._routing_provider.use_provider(self.provider):
+            return super().subscriptions
+
+    async def make_request(self, method, params):
+        with self._routing_provider.use_provider(self.provider):
+            return await super().make_request(method, params)
+
+    async def send(self, method, params):
+        with self._routing_provider.use_provider(self.provider):
+            return await super().send(method, params)
+
+    async def recv(self):
+        with self._routing_provider.use_provider(self.provider):
+            return await super().recv()
+
+    def process_subscriptions(self):
+        return RoutedPersistentMessageStream(
+            self._manager, self.provider, self._routing_provider
+        )
+
+
 class AsyncWeb3(_AsyncWeb3):
     def __init__(self, chain: "Chain", *args, **kwargs) -> None:
+        self._subscription_managers: dict[
+            int, tuple[PersistentConnectionProvider, SubscriptionManager]
+        ] = {}
+        self._persistent_connections: dict[
+            int, tuple[PersistentConnectionProvider, PersistentConnection]
+        ] = {}
         super().__init__(*args, **kwargs)
         self._chain = chain
+        self.manager.__class__ = RoutingRequestManager
+        cast(
+            RoutingRequestManager, self.manager
+        )._routing_provider = chain._routing_provider
+
+    def _selected_persistent_provider(self) -> PersistentConnectionProvider:
+        provider = self.provider
+        if not isinstance(provider, PersistentConnectionProvider):
+            raise Web3ValidationError(
+                "A persistent RPC provider is required for subscriptions"
+            )
+        return provider
+
+    @property
+    def subscription_manager(self) -> SubscriptionManager:
+        provider = self._selected_persistent_provider()
+        entry = self._subscription_managers.get(id(provider))
+        if entry is None or entry[0] is not provider:
+            entry = (
+                provider,
+                RoutedSubscriptionManager(
+                    self, provider, self._chain._routing_provider
+                ),
+            )
+            self._subscription_managers[id(provider)] = entry
+        return entry[1]
+
+    @property
+    def socket(self) -> PersistentConnection:
+        provider = self._selected_persistent_provider()
+        entry = self._persistent_connections.get(id(provider))
+        if entry is None or entry[0] is not provider:
+            entry = (
+                provider,
+                RoutedPersistentConnection(
+                    self, provider, self._chain._routing_provider
+                ),
+            )
+            self._persistent_connections[id(provider)] = entry
+        return entry[1]
 
     def __getattribute__(self, name: str) -> Any:
         value = super().__getattribute__(name)
-        if name == "provider" and value.__class__.__name__ != "PatchedProvider":
-            value = patch_provider(value, self._chain)
+        if name == "provider":
+            _active_chain_ctx_var.set(self._chain)
+            if value.__class__.__name__ != "PatchedProvider":
+                value = patch_provider(value)
         return value
 
 
@@ -183,15 +309,17 @@ class Chain:
             name: Human-readable name for the chain (e.g., 'Ethereum Mainnet')
 
         Note:
-            This constructor creates an unconnected Chain instance. Use Chain.connect()
-            class method to create a connected instance, or call connect_rpc() afterwards.
+            This constructor creates a Chain without an explicit RPC. Requests use
+            Chainlist unless a provider router is active. Use Chain.connect() or
+            connect_rpc() to set an explicit RPC.
         """
         # Internal AsyncWeb3 instance with custom middleware
-        # Initialize with a dummy provider to prevent AutoProvider from probing IPC/localhost
+        # Keep one provider in Web3 so requests can select a route by context.
+        self._routing_provider = RoutingProvider(chain_id, request_kwargs)
         self.__web3: AsyncWeb3 = AsyncWeb3(
             self,
             middleware=self._DEFAULT_MIDDLEWARE,
-            provider=get_chain_provider(chain_id, request_kwargs),
+            provider=self._routing_provider,
         )
         cast(Any, self.__web3).eth = AsyncEthProxy(self.__web3.eth, self)
         # Chain ID stored as string for consistency
@@ -277,6 +405,8 @@ class Chain:
 
     @property
     def batcher(self):
+        if self._routing_provider._executing_batch.get():
+            return None
         store = _batcher_ctx_var.get()
         return store.get(id(self)) if store else None
 
@@ -330,18 +460,20 @@ class Chain:
             ...         token3.get_balance(address3)
             ...     )
         """
-        token = None
-        try:
-            async with Batch(
-                self.__web3, max_size=max_size, max_wait=max_wait
-            ) as batcher:
-                store = _batcher_ctx_var.get() or {}
-                new_store = dict(store)
-                new_store[id(self)] = batcher
-                token = _batcher_ctx_var.set(new_store)
+        batcher = Batch(
+            self.__web3,
+            max_size=max_size,
+            max_wait=max_wait,
+            routing_provider=self._routing_provider,
+        )
+        store = _batcher_ctx_var.get() or {}
+        new_store = dict(store)
+        new_store[id(self)] = batcher
+        async with batcher:
+            token = _batcher_ctx_var.set(new_store)
+            try:
                 yield batcher
-        finally:
-            if token:
+            finally:
                 _batcher_ctx_var.reset(token)
 
     @asynccontextmanager
@@ -378,14 +510,16 @@ class Chain:
         batcher = self.batcher
         if batcher is None:
             raise RuntimeError("No active batch")
-        return await batcher._add_request_info(request_info)
+        return await batcher._add_request_info(
+            request_info, self._routing_provider._require_provider()
+        )
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
         if chain_id != w3_chain_id:
             raise ChainException(
                 f"{self.name}: Unexpected chain_id received "
-                "({w3_chain_id} vs expected {chain_id})"
+                f"({w3_chain_id} vs expected {chain_id})"
             )
 
     async def connect_rpc(
@@ -406,12 +540,12 @@ class Chain:
                 request_cache_validation_threshold=60 * 60,
             )
 
-        self.__web3.provider = provider
-        await self._verify_chain_id(self.chain_id)
+        with self._routing_provider.use_provider(provider):
+            await self._verify_chain_id(self.chain_id)
+        self._routing_provider.explicit_provider = provider
 
     async def close(self):
-        if await self.__web3.is_connected():
-            await self.__web3.provider.disconnect()
+        await self.__web3.provider.disconnect()
 
     @property
     def _web3(self) -> AsyncWeb3:

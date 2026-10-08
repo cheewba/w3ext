@@ -32,21 +32,37 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from contextvars import ContextVar
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakKeyDictionary
 
 from web3 import AsyncWeb3
 from web3._utils.batching import RPC_METHODS_UNSUPPORTED_DURING_BATCH
 from web3.method import Method
+from web3.providers import AsyncBaseProvider
+from web3.providers.persistent import PersistentConnectionProvider
 
 if TYPE_CHECKING:
     from .chain import Chain
+    from .chain.routers import RoutingProvider
 
 logger = logging.getLogger(__name__)
 
 
 _batch_request_processed = ContextVar[bool]("_batch_request_processed", default=False)
+_persistent_batch_locks: WeakKeyDictionary[
+    PersistentConnectionProvider, asyncio.Lock
+] = WeakKeyDictionary()
+
+
+def _persistent_batch_lock(provider: PersistentConnectionProvider) -> asyncio.Lock:
+    lock = _persistent_batch_locks.get(provider)
+    if lock is None:
+        lock = asyncio.Lock()
+        _persistent_batch_locks[provider] = lock
+    return lock
 
 
 def _dummy_checker(self):
@@ -83,9 +99,9 @@ def to_batch_aware_method(chain: "Chain", method: Callable):
             token = _batch_request_processed.set(True)
             try:
                 chain._web3.provider._is_batching = True
-                return await chain._add_to_batch_request_info(
-                    await method(*args, **kwargs)
-                )
+                with chain._routing_provider.collect_batch_info():
+                    request_info = await method(*args, **kwargs)
+                return await chain._add_to_batch_request_info(request_info)
             finally:
                 chain._web3.provider._is_batching = False
                 _batch_request_processed.reset(token)
@@ -182,6 +198,7 @@ class Batch:
         max_size: int = 20,
         max_wait: float = 0.1,
         timeout: float | None = 60,
+        routing_provider: "RoutingProvider | None" = None,
     ) -> None:
         """
         Initialize a new Batch processor.
@@ -197,13 +214,16 @@ class Batch:
         self._max_wait = max_wait
         self._timeout = timeout
         self._web3 = web3
+        self._routing_provider = routing_provider
 
         self._batcher = None
         self._batch_started = None
         self._validator: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
-    async def _add_request_info(self, request_info):
+    async def _add_request_info(
+        self, request_info, provider: AsyncBaseProvider | None = None
+    ):
         """
         Add a request to the batch queue.
 
@@ -222,7 +242,7 @@ class Batch:
         """
         (req := asyncio.Future()).set_result(request_info)
         async with self._lock:
-            self._requests.append((req, fut := asyncio.Future()))
+            self._requests.append((req, fut := asyncio.Future(), provider))
         if self._batch_started is None:
             self._batch_started = time.time()
 
@@ -307,7 +327,7 @@ class Batch:
         """
         semaphore = asyncio.Semaphore(3)
 
-        async def process(requests, futures):
+        async def process(requests, futures, provider):
             """
             Process a single batch of requests.
 
@@ -315,23 +335,47 @@ class Batch:
                 requests: List of request futures containing request info
                 futures: List of result futures to resolve with responses
             """
-            # since we need standart web3 batching to generate requests info only
-            # reset _is_batching flag to the value we expect to see, instead of True
-            # to not break upgraded batching logic
-            # batching = self._web3.provider._is_batching
-            batcher = self._web3.batch_requests()
-            # self._web3.provider._is_batching = batching
-            batcher._validate_is_batching = _dummy_checker.__get__(
-                batcher, batcher.__class__
+            route = (
+                self._routing_provider.use_provider(provider)
+                if self._routing_provider is not None and provider is not None
+                else nullcontext()
             )
+            execution = (
+                self._routing_provider.execute_batch()
+                if self._routing_provider is not None
+                else nullcontext()
+            )
+            with route, execution:
+                try:
 
-            for request in requests:
-                batcher.add(request)
+                    async def execute():
+                        batcher = self._web3.batch_requests()
+                        batcher._validate_is_batching = _dummy_checker.__get__(
+                            batcher, batcher.__class__
+                        )
 
-            try:
-                # Execute batch
-                async with semaphore:
-                    responses = await batcher.async_execute()
+                        for request in requests:
+                            batcher.add(request)
+
+                        async with semaphore:
+                            return await batcher.async_execute()
+
+                    if isinstance(provider, PersistentConnectionProvider):
+                        async with _persistent_batch_lock(provider):
+                            cast(Any, provider)._w3ext_wire_batch_active = True
+                            try:
+                                responses = await execute()
+                            finally:
+                                cast(Any, provider)._w3ext_wire_batch_active = False
+                    else:
+                        responses = await execute()
+                except Exception as e:
+                    logger.exception("Batch execution failed")
+                    for future in futures:
+                        if not future.done():
+                            future.set_exception(e)
+                    return
+
                 # Process results
                 for future, response in zip(futures, responses):
                     if not future.done():
@@ -339,18 +383,21 @@ class Batch:
                             future.set_exception(response)
                         else:
                             future.set_result(response)
-            except Exception as e:
-                # If batch fails, fail all futures
-                logger.exception("Batch execution failed")
-                for future in futures:
-                    if not future.done():
-                        future.set_exception(e)
 
-        # Process all requests in batches
+        # Keep each provider's calls together so a batch never crosses routes.
+        groups = {}
+        for request, future, provider in self._requests:
+            key = id(provider) if provider is not None else None
+            if key not in groups:
+                groups[key] = (provider, [])
+            groups[key][1].append((request, future))
+        self._requests.clear()
+
         tasks = []
-        while len(self._requests):
-            requests, futures = list(zip(*self._requests[: self._max_size]))
-            self._requests = self._requests[len(requests) :]
-            tasks.append(process(requests, futures))
+        for provider, group in groups.values():
+            batch_size = self._max_size or len(group)
+            for start in range(0, len(group), batch_size):
+                requests, futures = zip(*group[start : start + batch_size])
+                tasks.append(process(requests, futures, provider))
 
         await asyncio.gather(*tasks)
