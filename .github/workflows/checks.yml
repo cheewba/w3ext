@@ -1,0 +1,42 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e . "ruff==0.16.8"
+          npm install --global pyright@1.1.408
+
+      - name: Ruff lint
+        run: .venv/bin/ruff check src
+
+      - name: Ruff format
+        run: .venv/bin/ruff format --check src
+
+      - name: Pyright
+        run: pyright
+
+      - name: Python 3.11 compilation
+        run: .venv/bin/python -m compileall -q src
+
+      - name: Import package
+        run: .venv/bin/python -c "import w3ext"

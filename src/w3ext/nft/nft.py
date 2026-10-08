@@ -29,17 +29,18 @@ Example:
 
 # pylint: disable=no-name-in-module
 import asyncio
-from typing import Optional, Any, TYPE_CHECKING, Self, List, Dict
+from typing import TYPE_CHECKING, Any, Optional, Self
 
 import aiohttp
 from web3.types import TxParams
 
-from ..utils import to_checksum_address, AttrDict
 from ..exceptions import ChainException
+from ..utils import AttrDict, to_checksum_address
+
 if TYPE_CHECKING:
-    from .providers import DataProvider
     from ..account import Account
     from ..contract import Contract
+    from .providers import DataProvider
 
 
 class NftException(ChainException):
@@ -55,7 +56,6 @@ class NftException(ChainException):
         ... except NftException as e:
         ...     print(f"Failed to fetch metadata: {e}")
     """
-    pass
 
 
 class Nft721Collection:
@@ -112,12 +112,13 @@ class Nft721Collection:
             >>> balance = await collection.get_balance("0x123...")
             >>> print(f"User owns {balance} NFTs")
         """
-        return await self.contract.functions \
-            .balanceOf(to_checksum_address(address)) \
-            .call()
+        return await self.contract.functions.balanceOf(
+            to_checksum_address(address)
+        ).call()
 
-    async def get_owned_by(self, address: str,
-                           provider: Optional["DataProvider"] = None) -> list["Nft721"]:
+    async def get_owned_by(
+        self, address: str, provider: Optional["DataProvider"] = None
+    ) -> list["Nft721"]:
         """
         Get all NFTs owned by an address.
 
@@ -144,12 +145,16 @@ class Nft721Collection:
         # only for the ones that support enumeration extension for ERC-721
         total = await self.get_balance(address)
         ids = await asyncio.gather(
-            *[self.contract.functions.tokenOfOwnerByIndex(to_checksum_address(address), idx).call()
-              for idx in range(total)]
+            *[
+                self.contract.functions.tokenOfOwnerByIndex(
+                    to_checksum_address(address), idx
+                ).call()
+                for idx in range(total)
+            ]
         )
         return [Nft721(self, _id, address) for _id in ids]
 
-    def get_item(self, _id: str) -> "Nft721":
+    def get_item(self, _id: int | str) -> "Nft721":
         """
         Get an NFT instance by token ID.
 
@@ -194,7 +199,9 @@ class Nft721:
         >>> await nft.transfer(account, "0x456...")
     """
 
-    def __init__(self, collection: Nft721Collection, _id: int, owner: Optional[str] = None) -> None:
+    def __init__(
+        self, collection: Nft721Collection, _id: int | str, owner: str | None = None
+    ) -> None:
         """
         Initialize NFT instance.
 
@@ -208,12 +215,12 @@ class Nft721:
         # Token ID of this NFT
         self.id: int = int(_id)
         # Cached owner address (if known)
-        self._owner: Optional[str] = owner
+        self._owner: str | None = owner
         # Cached metadata (if fetched)
-        self._meta: Optional[AttrDict[str, Any]] = None
+        self._meta: AttrDict | None = None
 
     @classmethod
-    def parse_attributes(cls, attrs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def parse_attributes(cls, attrs: list[dict[str, Any]]) -> dict[str, Any]:
         """
         Parse NFT attributes from metadata format to a flat dictionary.
 
@@ -237,10 +244,10 @@ class Nft721:
         """
         prepared = {}
         for item in attrs:
-            if 'trait_type' not in item:
-                prepared[item['value']] = True
+            if "trait_type" not in item:
+                prepared[item["value"]] = True
                 continue
-            prepared[item['trait_type']] = item['value']
+            prepared[item["trait_type"]] = item["value"]
         return prepared
 
     @property
@@ -261,10 +268,12 @@ class Nft721:
             >>> print(nft.meta.attributes)
         """
         if self._meta is None:
-            raise NftException("Metadata not found. Try to refresh it by `refresh_metadata` call")
+            raise NftException(
+                "Metadata not found. Try to refresh it by `refresh_metadata` call"
+            )
         return self._meta
 
-    async def get_owner(self: Self, force: bool = False) -> Optional[str]:
+    async def get_owner(self: Self, force: bool = False) -> str | None:
         """
         Get the current owner of this NFT.
 
@@ -285,7 +294,9 @@ class Nft721:
             self._owner = await self.collection.functions.ownerOf(self.id).call()
         return self._owner
 
-    async def transfer(self: Self, account: "Account", to: str, *, tx: Optional[TxParams] = None) -> None:
+    async def transfer(
+        self: Self, account: "Account", to: str, *, tx: TxParams | None = None
+    ) -> None:
         """
         Transfer this NFT to another address.
 
@@ -309,9 +320,9 @@ class Nft721:
             ...     tx={"gas": 100000}
             ... )
         """
-        return await self.collection.functions \
-            .safeTransferFrom(account.address, to_checksum_address(to), self.id) \
-            .transact(account, tx)
+        return await self.collection.functions.safeTransferFrom(
+            account.address, to_checksum_address(to), self.id
+        ).transact(account, tx)
 
     async def refresh_metadata(self):
         """
@@ -332,8 +343,7 @@ class Nft721:
             >>> print(f"Attributes: {nft.meta.attributes}")
         """
         uri = await self.collection.functions.tokenURI(self.id).call()
-        async with aiohttp.ClientSession() as session:
-            async with session.get(uri) as resp:
-                meta = await resp.json()
-                meta["attributes"] = self.parse_attributes(meta.pop('attributes', {}))
+        async with aiohttp.ClientSession() as session, session.get(uri) as resp:
+            meta = await resp.json()
+            meta["attributes"] = self.parse_attributes(meta.pop("attributes", {}))
         self._meta = AttrDict(meta)

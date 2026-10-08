@@ -12,38 +12,47 @@ import os
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from typing import Optional, Any, Union, cast, Type, Dict
+from typing import Any, ClassVar, Optional, Union, cast
 
-from eth_typing import HexAddress, ChecksumAddress
 from eth_account.signers.local import LocalAccount
-from web3 import AsyncWeb3 as _AsyncWeb3, AsyncHTTPProvider
+from eth_typing import ChecksumAddress, HexAddress, HexStr
+from hexbytes import HexBytes
+from web3 import AsyncHTTPProvider
+from web3 import AsyncWeb3 as _AsyncWeb3
 from web3.eth import AsyncEth
-from web3.providers import AsyncBaseProvider
 from web3.middleware import (
     AttributeDictMiddleware,
     BufferedGasEstimateMiddleware,
+    ExtraDataToPOAMiddleware,
     GasPriceStrategyMiddleware,
     ValidationMiddleware,
-    ExtraDataToPOAMiddleware,
 )
-from web3.types import HexBytes, TxParams, HexStr, TxReceipt, StateOverride, BlockIdentifier
+from web3.providers import AsyncBaseProvider
+from web3.types import BlockIdentifier, StateOverride, TxParams, TxReceipt
 
-from .chainlist import get_chain_provider
-from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
+from ..account import Account
+from ..batch import Batch, is_batch_method, to_batch_aware_method
 from ..contract import Contract
 from ..exceptions import ChainException
-from ..token import Currency, Token, CurrencyAmount
 from ..nft import Nft721Collection
+from ..token import Currency, CurrencyAmount, Token
 from ..utils import (
-    is_eip1559, load_abi, to_checksum_address, AsyncSignSendRawMiddleware, get_gas_price,
+    AsyncSignSendRawMiddleware,
+    get_gas_price,
+    is_eip1559,
+    load_abi,
+    to_checksum_address,
 )
-from ..batch import Batch, is_batch_method, to_batch_aware_method
-from ..account import Account
+from .chainlist import get_chain_provider
+from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
 
-
-ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'abi')
-_batcher_ctx_var = ContextVar("_batcher_ctx_var", default={})
-_accounts_ctx_var = ContextVar("_accounts_ctx_var", default={})
+ABI_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "abi")
+_batcher_ctx_var: ContextVar[dict[int, Batch] | None] = ContextVar(
+    "_batcher_ctx_var", default=None
+)
+_accounts_ctx_var: ContextVar[dict[int, dict[ChecksumAddress, LocalAccount]] | None] = (
+    ContextVar("_accounts_ctx_var", default=None)
+)
 
 
 async def a_dummy(value):
@@ -69,17 +78,20 @@ class AsyncEthProxy:
                 return value.__get__(self, type(self))
 
             # For normal methods, check if it's a bound method (i.e. has __func__)
-            if hasattr(value, '__func__'):
+            if hasattr(value, "__func__"):
+                unbound = cast(Any, value).__func__
+
                 # Return a wrapper that calls the underlying unbound function with self replaced by the proxy.
                 @wraps(value)
                 def wrapper(*args, **kwargs):
-                    return value.__func__(self, *args, **kwargs)
+                    return unbound(self, *args, **kwargs)
+
                 return wrapper
 
         return value
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name not in ('_eth', '_chain'):
+        if name not in ("_eth", "_chain"):
             setattr(self._eth, name, value)
         super().__setattr__(name, value)
 
@@ -116,8 +128,8 @@ class AsyncWeb3(_AsyncWeb3):
 
     def __getattribute__(self, name: str) -> Any:
         value = super().__getattribute__(name)
-        if name == 'provider' and value.__class__.__name__ != "PatchedProvider":
-                value = patch_provider(value, self._chain)
+        if name == "provider" and value.__class__.__name__ != "PatchedProvider":
+            value = patch_provider(value, self._chain)
         return value
 
 
@@ -144,22 +156,22 @@ class Chain:
         chain_id (str): The chain ID as a string
     """
 
-    _DEFAULT_MIDDLEWARE = [
-            GasPriceStrategyMiddleware,
-            AttributeDictMiddleware,
-            ValidationMiddleware,
-            BufferedGasEstimateMiddleware,
-            ExtraDataToPOAMiddleware,
+    _DEFAULT_MIDDLEWARE: ClassVar[list] = [
+        GasPriceStrategyMiddleware,
+        AttributeDictMiddleware,
+        ValidationMiddleware,
+        BufferedGasEstimateMiddleware,
+        ExtraDataToPOAMiddleware,
     ]
 
     def __init__(
         self,
-        chain_id: Union[str, int],
-        currency: Union[str, 'Currency'] = 'ETH',
-        scan: Optional[str] = None,
-        name: Optional[str] = None,
+        chain_id: str | int,
+        currency: Union[str, "Currency"] = "ETH",
+        scan: str | None = None,
+        name: str | None = None,
         *,
-        request_kwargs: Optional[dict] = None
+        request_kwargs: dict | None = None,
     ) -> None:
         """
         Initialize a Chain instance.
@@ -179,45 +191,53 @@ class Chain:
         self.__web3: AsyncWeb3 = AsyncWeb3(
             self,
             middleware=self._DEFAULT_MIDDLEWARE,
-            provider=get_chain_provider(chain_id, request_kwargs)
+            provider=get_chain_provider(chain_id, request_kwargs),
         )
-        self.__web3.eth = AsyncEthProxy(self.__web3.eth, self)
+        cast(Any, self.__web3).eth = AsyncEthProxy(self.__web3.eth, self)
         # Chain ID stored as string for consistency
         self._chain_id: str = str(chain_id)
         # Cached EIP-1559 support detection result
-        self._is_eip1559: Optional[bool] = None
+        self._is_eip1559: bool | None = None
 
         self.currency = currency
         self.scan = scan
         self.name = name
 
         # Cache for loaded ABI files to avoid repeated disk reads
-        self._abi_cache: Dict[str, Any] = {}
+        self._abi_cache: dict[str, Any] = {}
 
         # install signing middleware that reads active accounts from chain context
-        if not self.__web3.middleware_onion.get('w3ext-signing'):
-            def _w3ext_signing_factory(w3, _self=self):
-                # Middleware pulls accounts from the current async context
-                return AsyncSignSendRawMiddleware(w3, lambda: _self._get_active_accounts())
-            self.__web3.middleware_onion.add(_w3ext_signing_factory, 'w3ext-signing')
+        if not self.__web3.middleware_onion.get("w3ext-signing"):
+            chain = self
+
+            class ChainSigningMiddleware(AsyncSignSendRawMiddleware):
+                def __init__(self, w3):
+                    super().__init__(w3, chain._get_active_accounts)
+
+            self.__web3.middleware_onion.add(ChainSigningMiddleware, "w3ext-signing")
 
         # install dynamic middleware proxy for context-specific middlewares
-        if not self.__web3.middleware_onion.get('w3ext-dynamic-context'):
-            def _dynamic_middleware_factory(w3):
-                return DynamicContextMiddleware(w3, self)
+        if not self.__web3.middleware_onion.get("w3ext-dynamic-context"):
+            chain = self
 
-            self.__web3.middleware_onion.add(_dynamic_middleware_factory, 'w3ext-dynamic-context')
+            class ChainDynamicContextMiddleware(DynamicContextMiddleware):
+                def __init__(self, w3):
+                    super().__init__(w3, chain)
+
+            self.__web3.middleware_onion.add(
+                ChainDynamicContextMiddleware, "w3ext-dynamic-context"
+            )
 
     @classmethod
     async def connect(
-        cls: Type["Chain"],
+        cls: type["Chain"],
         rpc: str,
-        chain_id: Union[str, int],
+        chain_id: str | int,
         *,
-        currency: Union[str, 'Currency'] = 'ETH',
-        scan: Optional[str] = None,
-        name: Optional[str] = None,
-        request_kwargs: Optional[dict] = None
+        currency: Union[str, "Currency"] = "ETH",
+        scan: str | None = None,
+        name: str | None = None,
+        request_kwargs: dict | None = None,
     ) -> "Chain":
         """
         Create and connect a Chain instance to an RPC endpoint.
@@ -261,7 +281,7 @@ class Chain:
         return store.get(id(self)) if store else None
 
     # Returns active signer accounts for this chain from the async context
-    def _get_active_accounts(self) -> Dict[ChecksumAddress, LocalAccount]:
+    def _get_active_accounts(self) -> dict[ChecksumAddress, LocalAccount]:
         store = _accounts_ctx_var.get()
         return store.get(id(self), {}) if store else {}
 
@@ -312,7 +332,9 @@ class Chain:
         """
         token = None
         try:
-            async with Batch(self.__web3, max_size=max_size, max_wait=max_wait) as batcher:
+            async with Batch(
+                self.__web3, max_size=max_size, max_wait=max_wait
+            ) as batcher:
                 store = _batcher_ctx_var.get() or {}
                 new_store = dict(store)
                 new_store[id(self)] = batcher
@@ -353,18 +375,21 @@ class Chain:
                 _middlewares_ctx_var.reset(token)
 
     async def _add_to_batch_request_info(self, request_info):
-        return await self.batcher._add_request_info(request_info)
+        batcher = self.batcher
+        if batcher is None:
+            raise RuntimeError("No active batch")
+        return await batcher._add_request_info(request_info)
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
         if chain_id != w3_chain_id:
-            raise ChainException(f"{self.name}: Unexpected chain_id received "
-                                 "({w3_chain_id} vs expected {chain_id})")
+            raise ChainException(
+                f"{self.name}: Unexpected chain_id received "
+                "({w3_chain_id} vs expected {chain_id})"
+            )
 
     async def connect_rpc(
-        self,
-        rpc: Union[str, AsyncBaseProvider],
-        request_kwargs: Optional[dict] = None
+        self, rpc: str | AsyncBaseProvider, request_kwargs: dict | None = None
     ) -> None:
         if isinstance(rpc, AsyncBaseProvider):
             provider = rpc
@@ -397,8 +422,10 @@ class Chain:
         return self._currency
 
     @currency.setter
-    def currency(self, currency: Union['Currency', str]):
-        self._currency = currency if isinstance(currency, Currency) else Currency(currency, currency)
+    def currency(self, currency: Union["Currency", str]):
+        self._currency = (
+            currency if isinstance(currency, Currency) else Currency(currency, currency)
+        )
 
     @property
     def chain_id(self):
@@ -406,17 +433,17 @@ class Chain:
 
     async def _get_abi(self, name):
         if name not in self._abi_cache:
-            self._abi_cache[name] = await self._load_abi(f'{name}.json')
+            self._abi_cache[name] = await self._load_abi(f"{name}.json")
         return self._abi_cache[name]
 
     async def _load_abi(self, name) -> Any:
         return await load_abi(os.path.join(ABI_PATH, name))
 
     async def erc20_abi(self):
-        return await self._get_abi('erc20')
+        return await self._get_abi("erc20")
 
     async def erc721_abi(self):
-        return await self._get_abi('erc721')
+        return await self._get_abi("erc721")
 
     async def is_eip1559(self) -> bool:
         if self._is_eip1559 is None:
@@ -425,14 +452,15 @@ class Chain:
 
     async def load_token(
         self,
-        contract: HexAddress, *,
-        cache_as: Optional[str] = None,
-        abi: Optional[Any] = None,
-        name: Optional[str] = None,
-        symbol: Optional[str] = None,
-        decimals: Optional[int] = None,
-        **kwargs
-    ) -> Optional['Token']:
+        contract: HexAddress,
+        *,
+        cache_as: str | None = None,
+        abi: Any | None = None,
+        name: str | None = None,
+        symbol: str | None = None,
+        decimals: int | None = None,
+        **kwargs,
+    ) -> Optional["Token"]:
         """
         Load an ERC20 token contract and create a Token instance.
 
@@ -474,15 +502,24 @@ class Chain:
         token_contract = self.contract(contract, abi=abi or await self.erc20_abi())
 
         # Combine explicit parameters with kwargs for backward compatibility
-        metadata = {'name': name, 'symbol': symbol, 'decimals': decimals}
+        metadata = {"name": name, "symbol": symbol, "decimals": decimals}
         metadata.update(kwargs)
 
         tasks = [
-            getattr(token_contract.functions, key)().call()
-            if (val := metadata.get(key)) is None else a_dummy(val)
-            for key in ['name', 'symbol', 'decimals']
+            (
+                getattr(token_contract.functions, key)().call()
+                if (val := metadata.get(key)) is None
+                else a_dummy(val)
+            )
+            for key in ["name", "symbol", "decimals"]
         ]
         name, symbol, decimals = await asyncio.gather(*tasks)
+        if (
+            not isinstance(name, str)
+            or (symbol is not None and not isinstance(symbol, str))
+            or not isinstance(decimals, int)
+        ):
+            raise ChainException("Invalid token metadata returned by contract")
 
         token = Token(token_contract, name, symbol, decimals)
         if cache_as is not None:
@@ -491,10 +528,11 @@ class Chain:
 
     async def load_nft721(
         self,
-        contract: HexAddress, *,
-        cache_as: Optional[str] = None,
-        abi: Optional[Any] = None
-    ) -> Optional['Nft721Collection']:
+        contract: HexAddress,
+        *,
+        cache_as: str | None = None,
+        abi: Any | None = None,
+    ) -> Optional["Nft721Collection"]:
         """
         Load an ERC721 NFT collection contract and create an Nft721Collection instance.
 
@@ -526,10 +564,8 @@ class Chain:
         return collection
 
     async def get_balance(
-        self,
-        address: Union[HexAddress, "Account"],
-        token: Optional[Token] = None
-    ) -> 'CurrencyAmount':
+        self, address: Union[HexAddress, "Account"], token: Token | None = None
+    ) -> "CurrencyAmount":
         """
         Get the balance of native currency or a specific token for an address.
 
@@ -560,9 +596,7 @@ class Chain:
         return CurrencyAmount(self.currency, amount)
 
     async def get_nonce(self, address: HexAddress) -> int:
-        return await self.eth.get_transaction_count(
-            cast(ChecksumAddress, address)
-        )
+        return await self.eth.get_transaction_count(cast(ChecksumAddress, address))
 
     async def get_gas_price(self) -> CurrencyAmount:
         """
@@ -584,36 +618,41 @@ class Chain:
     async def estimate_gas(
         self,
         transaction: TxParams,
-        block_identifier: Optional[BlockIdentifier] = None,
-        state_override: Optional[StateOverride] = None,
+        block_identifier: BlockIdentifier | None = None,
+        state_override: StateOverride | None = None,
     ) -> int:
-        return await self._web3.eth.estimate_gas(transaction, block_identifier, state_override)
+        return await self._web3.eth.estimate_gas(
+            transaction, block_identifier, state_override
+        )
 
-    async def send_transaction(self, tx: TxParams, account: Optional["Account"] = None) -> HexBytes:
+    async def send_transaction(
+        self, tx: TxParams, account: Optional["Account"] = None
+    ) -> HexBytes:
         with ExitStack() as stack:
             if account is not None:
                 stack.enter_context(account.onchain(self))
-                tx['from'] = account.address
-                tx['chainId'] = hex(int(self.chain_id))
-                if 'to' in tx:
-                    tx['to'] = to_checksum_address(tx['to'])
+                tx["from"] = account.address
+                tx["chainId"] = int(self.chain_id)
+                if "to" in tx:
+                    tx["to"] = to_checksum_address(tx["to"])
 
             return await self._web3.eth.send_transaction(tx)
 
         # silent mypy error "missing return statement"
         assert False, "unreachable"
 
-    async def send_raw_transaction(self, data: Union[HexStr, bytes]) -> HexBytes:
+    async def send_raw_transaction(self, data: HexStr | bytes) -> HexBytes:
         return await self._web3.eth.send_raw_transaction(data)
 
-    async def wait_for_transaction_receipt(self, tx_hash: HexBytes, timeout: float = 180) -> TxReceipt:
+    async def wait_for_transaction_receipt(
+        self, tx_hash: HexBytes, timeout: float = 180
+    ) -> TxReceipt:
         return await self._web3.eth.wait_for_transaction_receipt(tx_hash, timeout)
 
-    def contract(self, address: HexAddress, abi: Optional[Any] = None) -> 'Contract':
+    def contract(self, address: HexAddress, abi: Any | None = None) -> "Contract":
         address = to_checksum_address(address)
         contract = (
-            self._web3.eth.contract(address, abi=abi)
-            if abi is not None else address
+            self._web3.eth.contract(address, abi=abi) if abi is not None else address
         )
         return Contract(contract, self)
 
@@ -621,9 +660,9 @@ class Chain:
         if not self.scan:
             return tx_hash
         hash_str = tx_hash.hex()
-        if not hash_str.startswith('0x'):
+        if not hash_str.startswith("0x"):
             hash_str = f"0x{hash_str}"
-        scan_base = self.scan[:-1] if self.scan.endswith('/') else self.scan
+        scan_base = self.scan.removesuffix("/")
         return f"{scan_base}/tx/{hash_str}"
 
     def __getattr__(self, name) -> Any:

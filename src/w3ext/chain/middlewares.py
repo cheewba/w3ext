@@ -1,7 +1,10 @@
 from contextvars import ContextVar
+
 from web3.middleware import Web3Middleware
 
-_middlewares_ctx_var = ContextVar("_middlewares_ctx_var", default={})
+_middlewares_ctx_var: ContextVar[dict[int, list] | None] = ContextVar(
+    "_middlewares_ctx_var", default=None
+)
 
 
 class DynamicContextMiddleware(Web3Middleware):
@@ -11,7 +14,7 @@ class DynamicContextMiddleware(Web3Middleware):
 
     async def async_wrap_make_request(self, make_request):
         async def middleware(method, params):
-            store = _middlewares_ctx_var.get()
+            store = _middlewares_ctx_var.get() or {}
             # Get middlewares for this chain
             middlewares = store.get(id(self._chain_ref), [])
 
@@ -22,9 +25,9 @@ class DynamicContextMiddleware(Web3Middleware):
                 if isinstance(m, type):
                     # It's a class, assume v6 Web3Middleware
                     instance = m(self._w3)
-                    if hasattr(instance, 'async_wrap_make_request'):
+                    if hasattr(instance, "async_wrap_make_request"):
                         handler = await instance.async_wrap_make_request(handler)
-                    elif hasattr(instance, 'wrap_make_request'):
+                    elif hasattr(instance, "wrap_make_request"):
                         handler = instance.wrap_make_request(handler)
                     else:
                         # Fallback for class-based factory
@@ -34,4 +37,5 @@ class DynamicContextMiddleware(Web3Middleware):
                     handler = m(handler, self._w3)
 
             return await handler(method, params)
+
         return middleware
