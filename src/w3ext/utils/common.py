@@ -307,8 +307,8 @@ class AsyncSignSendRawMiddleware(Web3Middleware):
         transaction = params[0]
         transaction = await fill_chain_id(w3, transaction)
         transaction = await fill_nonce(w3, transaction)
-        transaction = await async_fill_transaction_defaults(w3, transaction)
         transaction = await fill_gas_price(w3, transaction)
+        transaction = await async_fill_transaction_defaults(w3, transaction)
         transaction = format_transaction(transaction)
 
         if "from" not in transaction:
