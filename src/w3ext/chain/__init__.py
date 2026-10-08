@@ -14,7 +14,7 @@ __all__ = [
     "ChainlistAsyncHTTPProvider",
     "TxParams",
     "TxReceipt",
+    "chain_providers_router",
     "get_chain_explorer",
     "get_chain_provider",
-    "chain_providers_router",
 ]

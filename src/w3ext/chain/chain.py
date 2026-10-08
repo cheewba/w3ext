@@ -335,7 +335,10 @@ class Chain:
         token = None
         try:
             async with Batch(
-                self.__web3, max_size=max_size, max_wait=max_wait
+                self.__web3,
+                max_size=max_size,
+                max_wait=max_wait,
+                routing_provider=self._routing_provider,
             ) as batcher:
                 store = _batcher_ctx_var.get() or {}
                 new_store = dict(store)
@@ -380,14 +383,16 @@ class Chain:
         batcher = self.batcher
         if batcher is None:
             raise RuntimeError("No active batch")
-        return await batcher._add_request_info(request_info)
+        return await batcher._add_request_info(
+            request_info, self._routing_provider._require_provider()
+        )
 
     async def _verify_chain_id(self, chain_id: str):
         w3_chain_id = str(await self._web3.eth.chain_id)
         if chain_id != w3_chain_id:
             raise ChainException(
                 f"{self.name}: Unexpected chain_id received "
-                "({w3_chain_id} vs expected {chain_id})"
+                f"({w3_chain_id} vs expected {chain_id})"
             )
 
     async def connect_rpc(
@@ -408,8 +413,9 @@ class Chain:
                 request_cache_validation_threshold=60 * 60,
             )
 
+        with self._routing_provider.use_provider(provider):
+            await self._verify_chain_id(self.chain_id)
         self._routing_provider.explicit_provider = provider
-        await self._verify_chain_id(self.chain_id)
 
     async def close(self):
         await self.__web3.provider.disconnect()

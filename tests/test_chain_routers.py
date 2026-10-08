@@ -1,6 +1,9 @@
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
+from hexbytes import HexBytes
+from web3.middleware import Web3Middleware, async_combine_middleware
 from web3.providers import AsyncBaseProvider
 
 from w3ext.chain import Chain, chain_providers_router
@@ -8,15 +11,16 @@ from w3ext.exceptions import ChainException
 
 
 class StubProvider(AsyncBaseProvider):
-    def __init__(self, block_number):
+    def __init__(self, block_number, chain_id=1):
         super().__init__()
         self.block_number = block_number
+        self.chain_id = chain_id
         self.requests = []
         self.batches = []
 
     async def make_request(self, method, params):
         self.requests.append((method, params))
-        result = "0x1" if method == "eth_chainId" else hex(self.block_number)
+        result = hex(self.chain_id) if method == "eth_chainId" else hex(self.block_number)
         return {"jsonrpc": "2.0", "id": 1, "result": result}
 
     async def make_batch_request(self, requests):
@@ -38,6 +42,31 @@ class StubRouter:
     def get_chain_provider(self, chain_id, request_kwargs=None):
         self.calls.append((chain_id, request_kwargs))
         return self.provider
+
+
+class NormalizeBlockMiddleware(Web3Middleware):
+    async def async_wrap_make_request(self, make_request):
+        async def middleware(method, params):
+            if method == "eth_getBalance":
+                params = (params[0], int(params[1], 16))
+            return await make_request(method, params)
+
+        return middleware
+
+
+class MiddlewareProvider(StubProvider):
+    async def request_func(self, async_w3, middleware_onion):
+        middleware = middleware_onion.as_tuple_of_middleware() + (
+            NormalizeBlockMiddleware,
+        )
+        return await async_combine_middleware(
+            middleware, async_w3, self.make_request
+        )
+
+    async def make_request(self, method, params):
+        if method == "eth_getBalance":
+            assert params[1] == 5
+        return await super().make_request(method, params)
 
 
 def test_router_is_used_for_existing_chain_and_restores_chainlist(monkeypatch):
@@ -168,5 +197,103 @@ def test_batch_requests_use_active_router(monkeypatch):
         assert len(routed.batches) == 1
         assert routed.batches[0][0][0] == "eth_getBalance"
         assert fallback.batches == []
+
+    asyncio.run(check())
+
+
+def test_batch_keeps_each_callers_route_and_groups_by_provider(monkeypatch):
+    fallback = StubProvider(1)
+    monkeypatch.setattr(
+        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+    )
+    chain = Chain(1)
+    first = StubProvider(7)
+    second = StubProvider(8)
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def read(router):
+        with chain_providers_router(router):
+            return await chain.eth.get_balance(address)
+
+    async def check():
+        async with chain.use_batch(max_size=3):
+            results = await asyncio.gather(
+                read(StubRouter(first)),
+                read(StubRouter(second)),
+                read(StubRouter(first)),
+            )
+        assert results == [7, 8, 7]
+        assert [len(batch) for batch in first.batches] == [2]
+        assert [len(batch) for batch in second.batches] == [1]
+        assert fallback.batches == []
+
+    asyncio.run(check())
+
+
+def test_none_inside_batch_does_not_send_to_chainlist(monkeypatch):
+    fallback = StubProvider(1)
+    monkeypatch.setattr(
+        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+    )
+    chain = Chain(1)
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def check():
+        async with chain.use_batch(max_size=1):
+            with chain_providers_router(None):
+                with pytest.raises(ChainException, match="No RPC provider configured"):
+                    await chain.eth.get_balance(address)
+        assert fallback.batches == []
+
+    asyncio.run(check())
+
+
+def test_connect_rpc_verifies_supplied_provider_under_forced_router():
+    chain = Chain(1)
+    routed = StubProvider(4, chain_id=1)
+    wrong = StubProvider(5, chain_id=2)
+
+    async def check():
+        with chain_providers_router(StubRouter(routed), force=True):
+            with pytest.raises(ChainException, match="2 vs expected 1"):
+                await chain.connect_rpc(wrong)
+        assert wrong.requests == [("eth_chainId", ())]
+        assert routed.requests == []
+        assert chain._routing_provider.explicit_provider is None
+
+    asyncio.run(check())
+
+
+def test_selected_provider_request_middleware_is_used():
+    chain = Chain(1)
+    provider = MiddlewareProvider(7)
+    address = "0x0000000000000000000000000000000000000001"
+
+    async def check():
+        await chain.connect_rpc(provider)
+        assert await chain.eth.get_balance(address, 5) == 7
+        assert provider.requests[-1][1][-1] == 5
+
+    asyncio.run(check())
+
+
+def test_ccip_policy_follows_selected_provider():
+    chain = Chain(1)
+    disabled = StubProvider(1)
+    disabled.global_ccip_read_enabled = False
+    disabled.ccip_read_max_redirects = 9
+    enabled = StubProvider(2)
+
+    async def check():
+        await chain.connect_rpc(enabled)
+        eth = chain._web3.eth
+        eth._call = AsyncMock(return_value=HexBytes("0x12"))
+        eth._durin_call = AsyncMock(return_value=HexBytes("0x34"))
+        with chain_providers_router(StubRouter(disabled), force=True):
+            assert chain._web3.provider.ccip_read_max_redirects == 9
+            assert await eth.call({"to": "0x0000000000000000000000000000000000000001"}) == HexBytes("0x12")
+        eth._call.assert_awaited_once()
+        eth._durin_call.assert_not_awaited()
+        assert chain._web3.provider.global_ccip_read_enabled is True
 
     asyncio.run(check())
