@@ -17,54 +17,81 @@ from web3.providers.persistent import PersistentConnectionProvider
 from web3.types import RPCEndpoint
 
 from ..exceptions import ChainException
-from .chainlist import get_chain_provider
+from .chainlist import default_chainlist_router
 from .middlewares import DynamicContextMiddleware, _middlewares_ctx_var
 
 
 class ChainProviderRouter(Protocol):
-    """Return a provider for a chain ID, or ``None`` to use Chainlist."""
+    """Return a provider for a chain ID, or ``None`` to try the next router."""
 
     def get_chain_provider(
         self, chain_id: int | str, request_kwargs: dict[str, Any] | None = None
     ) -> AsyncBaseProvider | None: ...
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class _RouterContext:
     router: ChainProviderRouter | None
     force: bool
 
 
-_router_context: ContextVar[_RouterContext | None] = ContextVar(
-    "chain_providers_router", default=None
+_default_router_context = _RouterContext(default_chainlist_router, False)
+_router_context: ContextVar[tuple[_RouterContext, ...]] = ContextVar(
+    "chain_providers_router", default=()
 )
 _router_provider_cache: ContextVar[
     dict[
-        tuple[int, weakref.ReferenceType[asyncio.Task[Any]] | None],
+        tuple[
+            _RouterContext,
+            weakref.ReferenceType[AsyncBaseProvider],
+            weakref.ReferenceType[asyncio.Task[Any]] | None,
+        ],
         AsyncBaseProvider | None,
     ]
     | None
 ] = ContextVar("chain_router_provider_cache", default=None)
 
 
+def _clear_router_provider_cache(router: ChainProviderRouter) -> None:
+    """Invalidate this task's selections after an owner releases reusable pools."""
+    cache = _router_provider_cache.get()
+    if cache is not None:
+        _router_provider_cache.set(
+            {
+                key: provider
+                for key, provider in cache.items()
+                if key[0].router is not router
+            }
+        )
+
+
 @contextmanager
 def chain_providers_router(
     router: ChainProviderRouter | None, *, force: bool = False
 ) -> Iterator[None]:
-    """Use the closest router in this async context.
+    """Try routers from the closest context through the default Chainlist router.
 
-    An explicit RPC takes precedence unless ``force=True``. If the router has no
-    provider for a chain, Chainlist is used. Passing ``None`` disables all
-    routers, including Chainlist, while preserving explicitly connected RPCs.
-    A task reuses its first provider selection for each chain until this context
-    exits.
+    Each non-forced entry gives an explicit RPC precedence; a forced entry tries
+    its router first. A router returning ``None`` falls through to the next entry.
+    Passing ``None`` stops all inherited routers and Chainlist, preserving only
+    the explicit RPC. A task reuses each entry's first selection for a Chain while
+    that entry remains active. Context exit changes selection, not connections.
     """
-    token = _router_context.set(_RouterContext(router, force))
-    cache_token = _router_provider_cache.set({})
+    context = _RouterContext(router, force)
+    token = _router_context.set((*_router_context.get(), context))
     try:
         yield
     finally:
-        _router_provider_cache.reset(cache_token)
+        cache = _router_provider_cache.get()
+        if cache is not None:
+            # Keep outer selections first made through a nested fallback.
+            _router_provider_cache.set(
+                {
+                    key: provider
+                    for key, provider in cache.items()
+                    if key[0] is not context
+                }
+            )
         _router_context.reset(token)
 
 
@@ -79,8 +106,9 @@ class RoutingProvider(AsyncJSONBaseProvider):
         self.request_kwargs = (
             dict(request_kwargs) if request_kwargs is not None else None
         )
-        self.chainlist_provider = get_chain_provider(chain_id, self.request_kwargs)
         self.explicit_provider: AsyncBaseProvider | None = None
+        # Retain selections across tasks/scopes. Each provider owns its cleanup policy.
+        self._selected_providers: dict[int, AsyncBaseProvider] = {}
         self._provider_override: ContextVar[AsyncBaseProvider | None] = ContextVar(
             f"chain_provider_override_{id(self)}", default=None
         )
@@ -142,22 +170,30 @@ class RoutingProvider(AsyncJSONBaseProvider):
         finally:
             self._bypass_context_request_processor.reset(token)
 
+    def _remember_provider(
+        self, provider: AsyncBaseProvider | None
+    ) -> AsyncBaseProvider | None:
+        if provider is not None:
+            self._selected_providers[id(provider)] = provider
+        return provider
+
     def _selected_provider(self) -> AsyncBaseProvider | None:
         override = self._provider_override.get()
         if override is not None:
-            return override
-        context = _router_context.get()
-        if context is not None and context.router is None:
-            return self.explicit_provider
-        if self.explicit_provider is not None and not (context and context.force):
-            return self.explicit_provider
-        if context is not None and context.router is not None:
+            return self._remember_provider(override)
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        task_ref = weakref.ref(task) if task is not None else None
+        stack = (_default_router_context, *_router_context.get())
+        for context in reversed(stack):
+            if context.router is None:
+                return self._remember_provider(self.explicit_provider)
+            if self.explicit_provider is not None and not context.force:
+                return self._remember_provider(self.explicit_provider)
             cache = _router_provider_cache.get() or {}
-            try:
-                task = asyncio.current_task()
-            except RuntimeError:
-                task = None
-            key = (id(self), weakref.ref(task) if task is not None else None)
+            key = (context, weakref.ref(cast(AsyncBaseProvider, self)), task_ref)
             if key in cache:
                 provider = cache[key]
             else:
@@ -169,8 +205,8 @@ class RoutingProvider(AsyncJSONBaseProvider):
             if provider is not None:
                 if not isinstance(provider, AsyncBaseProvider):
                     raise TypeError("Router must return an AsyncBaseProvider or None")
-                return provider
-        return self.chainlist_provider
+                return self._remember_provider(provider)
+        return None
 
     def _require_provider(self) -> AsyncBaseProvider:
         provider = self._selected_provider()
@@ -222,9 +258,25 @@ class RoutingProvider(AsyncJSONBaseProvider):
         )
 
     async def disconnect(self) -> None:
-        provider = self._selected_provider()
-        if provider is not None:
-            await provider.disconnect()
+        """Forward cleanup to selected providers without creating a new route."""
+        providers = dict(self._selected_providers)
+        if self.explicit_provider is not None:
+            providers[id(self.explicit_provider)] = self.explicit_provider
+
+        # Do not select a route here: cleanup must not create another provider.
+        results = await asyncio.gather(
+            *(provider.disconnect() for provider in providers.values()),
+            return_exceptions=True,
+        )
+        for (key, provider), result in zip(providers.items(), results):
+            if (
+                not isinstance(result, BaseException)
+                and self._selected_providers.get(key) is provider
+            ):
+                self._selected_providers.pop(key)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 class RoutingRequestManager(RequestManager):

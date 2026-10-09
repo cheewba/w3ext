@@ -4,13 +4,13 @@ Chainlist-based RPC provider and cached client.
 
 - ChainlistClient: fetches https://chainlist.org/rpcs.json once and caches it in-memory.
   Provides helpers to retrieve the first RPC URL for a given chain_id and EIP-3091 explorer URLs.
-- ChainlistAsyncHTTPProvider: AsyncHTTPProvider that lazily resolves the HTTP RPC endpoint
+- ChainlistAsyncHTTPProvider: shared HTTP provider that lazily resolves its endpoint
   from Chainlist on the first request if no RPC has been set explicitly. It uses the first
   HTTP(S) RPC for the provided chain_id.
 
 Usage example:
     from w3ext.chain.chainlist import get_chain_provider
-    provider = await get_chain_provider(1)  # Ethereum mainnet
+    provider = get_chain_provider(1)  # Ethereum mainnet
 
     # Or fetch explorer base URL:
     from w3ext.chain.chainlist import get_chain_explorer
@@ -24,12 +24,13 @@ Notes:
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 import aiohttp
-from web3 import AsyncHTTPProvider
+from web3.types import RPCEndpoint
 
 from ..exceptions import ChainException
+from .providers import HTTPProviderPool, SharedAsyncHTTPProvider
 
 CHAINLIST_RPCS_URL = "https://chainlist.org/rpcs.json"
 
@@ -116,7 +117,7 @@ class ChainlistClient:
         return await self._get_eip3091_explorer_base(chain_id)
 
 
-class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
+class ChainlistAsyncHTTPProvider(SharedAsyncHTTPProvider):
     """
     Async provider that resolves its HTTP endpoint from Chainlist on first use.
 
@@ -126,12 +127,18 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
 
     def __init__(
         self,
-        client: ChainlistClient,
+        client: ChainlistClient | None,
         chain_id: int | str,
         request_kwargs: dict[str, Any] | None = None,
+        *,
+        provider_pool: HTTPProviderPool | None = None,
+        client_factory: Callable[[], ChainlistClient] | None = None,
     ) -> None:
+        self._provider_pool = provider_pool or HTTPProviderPool()
+        self._owns_pool = provider_pool is None
         # Store resolution context; endpoint is chosen per-request
         self._client = client
+        self._client_factory = client_factory
         self._chain_id = int(chain_id)
         self._request_kwargs = dict(request_kwargs or {})
         self._ensure_lock = asyncio.Lock()
@@ -161,6 +168,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
 
     async def _pick_rpc(self, failed: set[str]) -> str | None:
         # Picks an HTTP(S) RPC not in the failed set; resets when all exhausted
+        assert self._client is not None
         urls = await self._client._get_http_rpcs(self._chain_id)
         if not urls:
             return None
@@ -172,7 +180,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
 
     async def _perform_with_rotation(
         self,
-        call: Callable[[], Awaitable[Any]],
+        call: Callable[[SharedAsyncHTTPProvider], Awaitable[Any]],
         is_error: Callable[[Any], bool],
         max_attempts: int = 3,
     ) -> Any:
@@ -187,9 +195,11 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
                 rpc = await self._pick_rpc(failed)
             if not rpc:
                 break
-            self.endpoint_uri = rpc
+            provider = self._provider_pool.get_provider(
+                self._chain_id, rpc, self._request_kwargs
+            )
             try:
-                resp = await call()
+                resp = await call(provider)
                 if is_error(resp):
                     last_resp = resp
                     failed.add(rpc)
@@ -198,6 +208,7 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
                     continue
                 # success path: stick to this rpc for subsequent calls
                 self._current_rpc = rpc
+                self.endpoint_uri = rpc
                 return resp
             except Exception as exc:  # noqa: BLE001 - retry after any RPC failure
                 last_exc = exc
@@ -214,21 +225,24 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
         )
 
     async def make_request(self, method: str, params: Any) -> Any:
+        await self._prepare_request()
+        if self._client_factory is not None:
+            self._client = self._client_factory()
         await self._ensure_endpoint()
 
         def is_error(resp: Any) -> bool:
             return isinstance(resp, dict) and "error" in resp
 
-        # Capture base method here to avoid zero-arg super() inside lambda
-        base_make_request = super().make_request
-
         return await self._perform_with_rotation(
-            lambda: base_make_request(method, params),
+            lambda provider: provider.make_request(RPCEndpoint(method), params),
             is_error,
             max_attempts=3,
         )
 
     async def make_batch_request(self, batch_requests):
+        await self._prepare_request()
+        if self._client_factory is not None:
+            self._client = self._client_factory()
         await self._ensure_endpoint()
 
         def is_error(resp: Any) -> bool:
@@ -238,34 +252,133 @@ class ChainlistAsyncHTTPProvider(AsyncHTTPProvider):
                 return any(isinstance(r, dict) and "error" in r for r in resp)
             return False
 
-        # Capture base method here to avoid zero-arg super() inside lambda
-        base_make_batch = super().make_batch_request
-
         return await self._perform_with_rotation(
-            lambda: base_make_batch(batch_requests),
+            lambda provider: provider.make_batch_request(batch_requests),
             is_error,
             max_attempts=3,
         )
 
+    async def disconnect(self) -> None:
+        # Standalone providers own their pool; router-provided wrappers borrow it.
+        if self._owns_pool:
+            await self.close()
 
-# Module-level singleton client instance and exported helpers
-_client = ChainlistClient()
+    async def close(self) -> None:
+        await super().close()
+        if self._owns_pool:
+            await self._provider_pool.close()
+
+
+class ChainlistRouter:
+    """Own pooled Chainlist providers and their HTTP transports."""
+
+    def __init__(self, *, auto_cleanup: bool = False) -> None:
+        self._auto_cleanup = auto_cleanup
+        self._clients: dict[asyncio.AbstractEventLoop | None, ChainlistClient] = {}
+        self._transports = HTTPProviderPool(
+            auto_cleanup=auto_cleanup,
+            provider_factory=lambda chain_id, endpoint_uri, request_kwargs: (
+                SharedAsyncHTTPProvider(
+                    endpoint_uri,
+                    request_kwargs,
+                    exception_retry_configuration=None,
+                    cache_allowed_requests=True,
+                    cacheable_requests={"eth_chainId"},
+                    request_cache_validation_threshold=60 * 60,
+                )
+            ),
+        )
+        self._providers = HTTPProviderPool(
+            auto_cleanup=auto_cleanup,
+            provider_factory=self._make_provider,
+            on_loop_closed=self._forget_client,
+        )
+
+    def _forget_client(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._clients.pop(loop, None)
+
+    def _get_client(self) -> ChainlistClient:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop not in self._clients:
+            self._clients[loop] = ChainlistClient()
+        return self._clients[loop]
+
+    def _make_provider(self, chain_id, endpoint_uri, request_kwargs):
+        return ChainlistAsyncHTTPProvider(
+            None,
+            chain_id,
+            request_kwargs,
+            provider_pool=self._transports,
+            client_factory=self._get_client,
+        )
+
+    def get_chain_provider(
+        self, chain_id: int | str, request_kwargs: dict[str, Any] | None = None
+    ) -> ChainlistAsyncHTTPProvider:
+        return cast(
+            ChainlistAsyncHTTPProvider,
+            self._providers.get_provider(chain_id, "http://localhost", request_kwargs),
+        )
+
+    async def get_chain_explorer(self, chain_id: int | str) -> str | None:
+        if self._auto_cleanup:
+            await self._providers._ensure_lifetime()
+        return await self._get_client().get_chain_explorer(chain_id)
+
+    async def close_current_loop(self) -> None:
+        """Close default-router resources before stopping a manually driven loop."""
+        await self._providers.close_current_loop()
+        await self._transports.close_current_loop()
+        self._clients.pop(asyncio.get_running_loop(), None)
+
+    async def close(self) -> None:
+        try:
+            await self._providers.close()
+        finally:
+            await self._transports.close()
+        self._clients.clear()
+
+    async def __aenter__(self):
+        await self._providers.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self.close()
+
+
+default_chainlist_router = ChainlistRouter(auto_cleanup=True)
 
 
 def get_chain_provider(
     chain_id: int | str,
     request_kwargs: dict[str, Any] | None = None,
 ) -> ChainlistAsyncHTTPProvider:
-    return _client.get_chain_provider(chain_id, request_kwargs)
+    return default_chainlist_router.get_chain_provider(chain_id, request_kwargs)
 
 
 async def get_chain_explorer(chain_id: int | str) -> str | None:
-    return await _client.get_chain_explorer(chain_id)
+    return await default_chainlist_router.get_chain_explorer(chain_id)
+
+
+async def close_default_chainlist_router() -> None:
+    """Close the current event loop's default RPC pool before loop shutdown."""
+    try:
+        await default_chainlist_router.close_current_loop()
+    finally:
+        from .routers import _clear_router_provider_cache
+
+        _clear_router_provider_cache(default_chainlist_router)
 
 
 __all__ = [
     "ChainlistAsyncHTTPProvider",
     "ChainlistClient",
+    "ChainlistRouter",
+    "close_default_chainlist_router",
+    "default_chainlist_router",
     "get_chain_explorer",
     "get_chain_provider",
 ]

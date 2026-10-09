@@ -154,34 +154,48 @@ async def get_gas_price(w3: Chain) -> int:
 
 
 async def fill_gas_price(w3: AsyncWeb3 | Chain, transaction: TxParams) -> TxParams:
+    """Fill missing fees while preserving the transaction's selected fee model.
+
+    Explicit transaction types and supplied legacy or dynamic fees take precedence
+    over the network default. Conflicting models are rejected before requesting fees.
+    Existing fee values are preserved; only missing fields are filled.
     """
-    Fill gas price in a transaction if not already set.
-
-    For EIP-1559 networks, it sets 'maxFeePerGas' and 'maxPriorityFeePerGas' if they
-    are not provided. For legacy networks, it sets 'gasPrice'.
-
-    Args:
-        w3: An AsyncWeb3 or Chain instance.
-        transaction: The transaction dictionary.
-
-    Returns:
-        The transaction dictionary with gas price parameters filled.
-    """
-    _eip1559 = await (is_eip1559(w3) if isinstance(w3, AsyncWeb3) else w3.is_eip1559())
+    legacy = "gasPrice" in transaction
+    dynamic = "maxFeePerGas" in transaction or "maxPriorityFeePerGas" in transaction
+    transaction_type = transaction.get("type")
+    if isinstance(transaction_type, str):
+        transaction_type = int(transaction_type, 16)
+    if legacy and dynamic:
+        raise ValueError("gasPrice cannot be combined with EIP-1559 fee fields")
+    if transaction_type in (0, 1):
+        if dynamic:
+            raise ValueError("Legacy transaction type cannot use EIP-1559 fee fields")
+        _eip1559 = False
+    elif transaction_type in (2, 3, 4):
+        if legacy:
+            raise ValueError("Dynamic transaction type cannot use gasPrice")
+        _eip1559 = True
+    elif legacy:
+        return transaction
+    elif dynamic:
+        _eip1559 = True
+    else:
+        _eip1559 = await (
+            is_eip1559(w3) if isinstance(w3, AsyncWeb3) else w3.is_eip1559()
+        )
     if _eip1559:
-        if (
-            "maxFeePerGas" not in transaction
-            or "maxPriorityFeePerGas" not in transaction
-        ):
+        if "maxPriorityFeePerGas" not in transaction:
+            transaction["maxPriorityFeePerGas"] = await w3.eth.max_priority_fee
+        if "maxFeePerGas" not in transaction:
             base_fee = (await w3.eth.get_block("latest")).get("baseFeePerGas")
             if base_fee is None:
                 raise ValueError("Latest block has no base fee")
-            priority_fee = await w3.eth.max_priority_fee
-            transaction["maxPriorityFeePerGas"] = priority_fee
+            priority_fee = transaction["maxPriorityFeePerGas"]
+            if isinstance(priority_fee, str):
+                priority_fee = int(priority_fee, 16)
             transaction["maxFeePerGas"] = Wei(int(base_fee * 1.2) + priority_fee)
-    elif "gasPrice" not in transaction:
+    elif not legacy:
         transaction["gasPrice"] = await w3.eth.gas_price
-
     return transaction
 
 

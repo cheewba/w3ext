@@ -8,10 +8,10 @@ from hexbytes import HexBytes
 from web3 import AsyncIPCProvider, WebSocketProvider
 from web3._utils.caching import generate_cache_key
 from web3.exceptions import MethodNotSupported, SubscriptionProcessingFinished
-from web3.types import RPCEndpoint
 from web3.middleware import Web3Middleware, async_combine_middleware
 from web3.providers import AsyncBaseProvider
 from web3.providers.persistent.request_processor import RequestInformation
+from web3.types import RPCEndpoint
 from web3.utils.subscriptions import NewHeadsSubscription
 
 from w3ext.account import Account
@@ -81,7 +81,8 @@ class MiddlewareProvider(StubProvider):
 def test_router_is_used_for_existing_chain_and_restores_chainlist(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1, request_kwargs={"timeout": 7})
     routed = StubProvider(2)
@@ -100,7 +101,8 @@ def test_router_is_used_for_existing_chain_and_restores_chainlist(monkeypatch):
 def test_explicit_provider_wins_unless_closest_router_is_forced(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1)
     explicit = StubProvider(3)
@@ -123,24 +125,190 @@ def test_explicit_provider_wins_unless_closest_router_is_forced(monkeypatch):
     asyncio.run(check())
 
 
-def test_router_without_provider_falls_back_to_chainlist(monkeypatch):
+def test_router_without_provider_falls_back_through_outer_routers(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1)
     empty = StubRouter(None)
     outer = StubRouter(StubProvider(9))
 
     async def check():
+        with chain_providers_router(empty):
+            assert await chain.eth.block_number == 1
         with chain_providers_router(outer):
             assert await chain.eth.block_number == 9
             with chain_providers_router(empty):
-                assert await chain.eth.block_number == 1
+                assert await chain.eth.block_number == 9
         await chain.connect_rpc(StubProvider(3))
         with chain_providers_router(empty, force=True):
-            assert await chain.eth.block_number == 1
+            assert await chain.eth.block_number == 3
+        assert empty.calls == [(1, None), (1, None), (1, None)]
+
+    asyncio.run(check())
+
+
+def test_forced_fallback_obeys_each_outer_entries_precedence():
+    chain = Chain(1)
+    explicit = StubProvider(3)
+    outer = StubRouter(StubProvider(9))
+    empty = StubRouter(None)
+
+    async def check():
+        await chain.connect_rpc(explicit)
+        with (
+            chain_providers_router(outer, force=True),
+            chain_providers_router(empty, force=True),
+        ):
+            assert await chain.eth.block_number == 9
+        with (
+            chain_providers_router(outer),
+            chain_providers_router(empty, force=True),
+        ):
+            assert await chain.eth.block_number == 3
+        assert outer.calls == [(1, None)]
         assert empty.calls == [(1, None), (1, None)]
+
+    asyncio.run(check())
+
+
+def test_none_barrier_stops_fallback_but_allows_closer_routers(monkeypatch):
+    fallback = StubRouter(StubProvider(1))
+    monkeypatch.setattr(
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        fallback.get_chain_provider,
+    )
+    chain = Chain(1)
+    outer = StubRouter(StubProvider(9))
+    inner = StubRouter(StubProvider(7))
+    empty = StubRouter(None)
+
+    async def check():
+        with chain_providers_router(outer, force=True), chain_providers_router(None):
+            with chain_providers_router(inner):
+                assert await chain.eth.block_number == 7
+            with (
+                chain_providers_router(empty, force=True),
+                pytest.raises(ChainException, match="No RPC provider configured"),
+            ):
+                await chain.eth.block_number
+            await chain.connect_rpc(StubProvider(3))
+            with chain_providers_router(empty, force=True):
+                assert await chain.eth.block_number == 3
+        assert outer.calls == []
+        assert fallback.calls == []
+
+    asyncio.run(check())
+
+
+def test_nested_fallback_keeps_outer_selection_and_separates_entries():
+    chain = Chain(1)
+
+    class SequenceRouter:
+        def __init__(self, *numbers):
+            self.providers = iter(StubProvider(number) for number in numbers)
+            self.calls = 0
+
+        def get_chain_provider(self, chain_id, request_kwargs=None):
+            self.calls += 1
+            return next(self.providers)
+
+    outer = SequenceRouter(7, 8)
+    inner = SequenceRouter(11, 12)
+    empty = StubRouter(None)
+
+    async def check():
+        with chain_providers_router(outer):
+            # First select the outer provider through an unsupported inner entry.
+            with chain_providers_router(empty):
+                assert await chain.eth.block_number == 7
+                assert await chain.eth.block_number == 7
+            assert await chain.eth.block_number == 7
+            with chain_providers_router(inner):
+                assert await chain.eth.block_number == 11
+                assert await chain.eth.block_number == 11
+            assert await chain.eth.block_number == 7
+            # Re-entering the same router object creates an independent entry.
+            with chain_providers_router(inner):
+                assert await chain.eth.block_number == 12
+            assert await chain.eth.block_number == 7
+        assert outer.calls == 1
+        assert inner.calls == 2
+        assert empty.calls == [(1, None)]
+
+    asyncio.run(check())
+
+
+def test_default_router_is_lazy_and_cleanup_uses_previous_selections(monkeypatch):
+    fallback = StubProvider(1)
+    routed = StubProvider(7)
+    explicit = StubProvider(3)
+    for provider in (fallback, routed, explicit):
+        provider.disconnect = AsyncMock()
+    default = StubRouter(fallback)
+    monkeypatch.setattr(
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        default.get_chain_provider,
+    )
+    chain = Chain(1, request_kwargs={"timeout": 7})
+    assert default.calls == []
+
+    async def check():
+        assert await chain.eth.block_number == 1
+        with chain_providers_router(StubRouter(routed)):
+            assert await chain.eth.block_number == 7
+        assert await chain.eth.block_number == 1
+        await chain.connect_rpc(explicit)
+        with chain_providers_router(None):
+            await chain.close()
+        assert default.calls == [(1, {"timeout": 7})]
+        for provider in (fallback, routed, explicit):
+            provider.disconnect.assert_awaited_once()
+
+    asyncio.run(check())
+
+
+def test_default_shutdown_allows_same_task_and_chain_to_select_again(monkeypatch):
+    from w3ext.chain.chainlist import close_default_chainlist_router
+
+    class ClosingProvider(StubProvider):
+        closed = False
+
+        async def make_request(self, method, params):
+            if self.closed:
+                raise RuntimeError("Router provider is closed")
+            return await super().make_request(method, params)
+
+    providers = []
+
+    def get_provider(*_):
+        if not providers or providers[-1].closed:
+            providers.append(ClosingProvider(len(providers) + 1))
+        return providers[-1]
+
+    async def close_current_loop():
+        providers[-1].closed = True
+
+    monkeypatch.setattr(
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        get_provider,
+    )
+    close = AsyncMock(side_effect=close_current_loop)
+    monkeypatch.setattr(
+        "w3ext.chain.routers.default_chainlist_router.close_current_loop", close
+    )
+    chain = Chain(1)
+
+    async def check():
+        assert await chain.eth.block_number == 1
+        await close_default_chainlist_router()
+        assert providers[0].closed
+        assert await chain.eth.block_number == 2
+        assert await chain.eth.block_number == 2
+        assert len(providers) == 2
+        close.assert_awaited_once()
 
     asyncio.run(check())
 
@@ -148,7 +316,8 @@ def test_router_without_provider_falls_back_to_chainlist(monkeypatch):
 def test_none_disables_all_routers_but_keeps_explicit_rpc(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1)
     outer = StubRouter(StubProvider(2))
@@ -174,7 +343,8 @@ def test_none_disables_all_routers_but_keeps_explicit_rpc(monkeypatch):
 
 def test_router_context_is_isolated_across_async_tasks(monkeypatch):
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: StubProvider(1)
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: StubProvider(1),
     )
     chain = Chain(1)
 
@@ -192,7 +362,8 @@ def test_router_context_is_isolated_across_async_tasks(monkeypatch):
 
 def test_shared_router_context_selects_provider_per_task(monkeypatch):
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: StubProvider(1)
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: StubProvider(1),
     )
     chain = Chain(1)
     providers = {"first": StubProvider(7), "second": StubProvider(8)}
@@ -216,7 +387,8 @@ def test_shared_router_context_selects_provider_per_task(monkeypatch):
 
 def test_child_task_does_not_inherit_parent_provider_selection(monkeypatch):
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: StubProvider(1)
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: StubProvider(1),
     )
     chain = Chain(1)
     parent_provider = StubProvider(7)
@@ -243,7 +415,8 @@ def test_child_task_does_not_inherit_parent_provider_selection(monkeypatch):
 def test_batch_requests_use_active_router(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1)
     routed = StubProvider(2)
@@ -263,7 +436,8 @@ def test_batch_requests_use_active_router(monkeypatch):
 def test_batch_keeps_each_callers_route_and_groups_by_provider(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1)
     first = StubProvider(7)
@@ -292,7 +466,8 @@ def test_batch_keeps_each_callers_route_and_groups_by_provider(monkeypatch):
 def test_none_inside_batch_does_not_send_to_chainlist(monkeypatch):
     fallback = StubProvider(1)
     monkeypatch.setattr(
-        "w3ext.chain.routers.get_chain_provider", lambda *_: fallback
+        "w3ext.chain.routers.default_chainlist_router.get_chain_provider",
+        lambda *_: fallback,
     )
     chain = Chain(1)
     address = "0x0000000000000000000000000000000000000001"

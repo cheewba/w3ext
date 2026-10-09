@@ -87,31 +87,56 @@ chain = Chain(
 await chain.connect_rpc("https://mainnet.infura.io/v3/YOUR_PROJECT_ID")
 ```
 
-Chains without an explicit RPC use Chainlist. You can choose a provider for the
-current context with `chain_providers_router`:
+Chains without an explicit RPC use the default Chainlist router. Choose another
+router for the current context with `chain_providers_router`:
 
 ```python
-from w3ext import chain_providers_router
-from web3 import AsyncHTTPProvider
+from w3ext import Chain, HTTPProviderPool, chain_providers_router
 
 class MyRouter:
+    def __init__(self):
+        self.providers = HTTPProviderPool()
+
     def get_chain_provider(self, chain_id, request_kwargs=None):
         if str(chain_id) == "1":
-            return AsyncHTTPProvider("https://my-ethereum-rpc.example", request_kwargs)
-        return None  # Fall back to Chainlist for other chains
+            return self.providers.get_provider(
+                chain_id, "https://my-ethereum-rpc.example", request_kwargs
+            )
+        return None  # Try the next router in the stack.
+
+    async def close(self):
+        await self.providers.close()
 
 chain = Chain(1)
-with chain_providers_router(MyRouter()):
-    balance = await chain.get_balance(address)
+router = MyRouter()
+try:
+    with chain_providers_router(router):
+        balance = await chain.get_balance(address)
+finally:
+    await router.close()
 ```
 
-The closest context applies to each call, including calls on chains created
-before the context. An RPC set with `connect_rpc` takes precedence unless the
-context uses `force=True`. Passing `None` disables routers and Chainlist in that
-context, leaving only explicitly connected RPCs. Routers should return an
-`AsyncBaseProvider` or `None`; reuse provider instances if they hold connection
-state. Each task reuses its first router selection per chain until the context
-exits.
+Routers form a context-local stack, checked from the innermost context through
+the default non-forced Chainlist entry. Each non-forced entry gives an RPC set
+with `connect_rpc` precedence; a forced entry tries its router first. Returning
+`None` falls through to the next entry. Passing `None` to
+`chain_providers_router` stops inherited routers, including Chainlist, while
+preserving an explicit RPC. Each task keeps its first selection per Chain and
+stack entry until that entry exits. Context exit changes routing only.
+
+`Chain.close()` forwards `disconnect()` to providers it has used without creating
+a new route or applying router-specific ownership rules. Ordinary providers close
+their connections. `SharedAsyncHTTPProvider.disconnect()` keeps its transport open;
+the owning router calls `close()` instead. `HTTPProviderPool` reuses shared providers
+when their event loop, chain ID, endpoint, and request options match. A closed
+router's retained providers cannot open new sessions.
+
+Chainlist owns pooled providers with fixed-endpoint transports for failover.
+The default router closes its per-loop pool automatically during `asyncio.run`
+shutdown. If an application drives its loop manually, it must await
+`close_default_chainlist_router()` before stopping the loop; this releases the
+current loop's default pool, which can be recreated for later calls.
+Explicitly created routers are closed by their owner, including after cancellation.
 
 #### Balance Queries
 

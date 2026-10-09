@@ -545,7 +545,8 @@ class Chain:
         self._routing_provider.explicit_provider = provider
 
     async def close(self):
-        await self.__web3.provider.disconnect()
+        """Ask every used provider to disconnect, honoring its cleanup policy."""
+        await self._routing_provider.disconnect()
 
     @property
     def _web3(self) -> AsyncWeb3:
