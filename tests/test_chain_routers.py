@@ -29,7 +29,9 @@ class StubProvider(AsyncBaseProvider):
 
     async def make_request(self, method, params):
         self.requests.append((method, params))
-        result = hex(self.chain_id) if method == "eth_chainId" else hex(self.block_number)
+        result = (
+            hex(self.chain_id) if method == "eth_chainId" else hex(self.block_number)
+        )
         return {"jsonrpc": "2.0", "id": 1, "result": result}
 
     async def make_batch_request(self, requests):
@@ -68,9 +70,7 @@ class MiddlewareProvider(StubProvider):
         middleware = middleware_onion.as_tuple_of_middleware() + (
             NormalizeBlockMiddleware,
         )
-        return await async_combine_middleware(
-            middleware, async_w3, self.make_request
-        )
+        return await async_combine_middleware(middleware, async_w3, self.make_request)
 
     async def make_request(self, method, params):
         if method == "eth_getBalance":
@@ -525,7 +525,9 @@ def test_ccip_policy_follows_selected_provider():
         eth._durin_call = AsyncMock(return_value=HexBytes("0x34"))
         with chain_providers_router(StubRouter(disabled), force=True):
             assert chain._web3.provider.ccip_read_max_redirects == 9
-            assert await eth.call({"to": "0x0000000000000000000000000000000000000001"}) == HexBytes("0x12")
+            assert await eth.call(
+                {"to": "0x0000000000000000000000000000000000000001"}
+            ) == HexBytes("0x12")
         eth._call.assert_awaited_once()
         eth._durin_call.assert_not_awaited()
         assert chain._web3.provider.global_ccip_read_enabled is True
@@ -681,9 +683,7 @@ def test_retained_socket_uses_its_original_provider():
         (AsyncIPCProvider, "/tmp/w3ext-nonexistent.ipc"),
     ],
 )
-def test_persistent_batch_formats_multiple_results(
-    provider_class, endpoint
-):
+def test_persistent_batch_formats_multiple_results(provider_class, endpoint):
     chain = Chain(1)
     provider = provider_class(endpoint)
     provider.make_batch_request = AsyncMock(
@@ -818,8 +818,7 @@ def test_persistent_batch_formats_results_after_nested_chain_id_rpc(
 
     async def make_batch_request(requests):
         encoded = [
-            provider.form_request(rpc_method, params)
-            for rpc_method, params in requests
+            provider.form_request(rpc_method, params) for rpc_method, params in requests
         ]
         batch_ids.extend(request["id"] for request in encoded)
         return [
@@ -833,9 +832,7 @@ def test_persistent_batch_formats_results_after_nested_chain_id_rpc(
     async def check():
         with chain_providers_router(StubRouter(provider)):
             async with chain.use_batch(max_size=1):
-                actual = await getattr(chain.eth, method)(
-                    {"to": address, "chainId": 1}
-                )
+                actual = await getattr(chain.eth, method)({"to": address, "chainId": 1})
                 assert actual == expected
         assert nested_ids
         assert batch_ids[0] > nested_ids[0]
@@ -980,6 +977,7 @@ def test_context_middleware_can_short_circuit_batch_requests(persistent):
     uncached = "0x0000000000000000000000000000000000000002"
 
     if persistent:
+
         async def make_batch_request(requests):
             sent_batches.append(requests)
             return [
@@ -1171,7 +1169,9 @@ def test_send_transaction_signs_with_persistent_route(monkeypatch):
         return {"jsonrpc": "2.0", "id": len(sent), "method": method, "params": params}
 
     provider.send_request = send_request
-    chain._web3.manager.recv_for_request = AsyncMock(return_value=HexBytes("0x" + "ab" * 32))
+    chain._web3.manager.recv_for_request = AsyncMock(
+        return_value=HexBytes("0x" + "ab" * 32)
+    )
     monkeypatch.setattr("w3ext.utils.common.is_eip1559", AsyncMock(return_value=False))
 
     async def check():
