@@ -23,8 +23,8 @@ pip install -e git+https://github.com/cheewba/w3ext.git#egg=w3ext
 ### Requirements
 
 - Python 3.11+
-- web3.py 7.9.*
-- aiohttp 3.11.*
+- web3.py 8.0.0
+- aiohttp 3.14.5
 
 ## Quick Start
 

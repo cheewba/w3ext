@@ -393,13 +393,13 @@ class RoutingRequestManager(RequestManager):
                 ((method, params), formatters), response
             )
 
-    async def _async_make_batch_request(self, requests_info):
+    async def _async_make_socket_batch_request(self, requests_info):
         provider = self._provider
         if not (
             self._routing_provider._executing_batch.get()
             and isinstance(provider, PersistentConnectionProvider)
         ):
-            return await super()._async_make_batch_request(requests_info)
+            return await super()._async_make_socket_batch_request(requests_info)
 
         # Web3 normally looks up persistent batch formatters by a predicted RPC ID.
         # Middleware can issue an RPC before the batch is encoded, consuming that ID.
